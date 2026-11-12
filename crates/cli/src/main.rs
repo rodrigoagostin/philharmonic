@@ -63,6 +63,18 @@ enum Command {
     },
     /// Stop the agent, delete the worktree and branch, forget the task.
     Rm { id: TaskId },
+    /// List the Claude Code conversations already started in a repo.
+    Threads {
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
+    /// Turn existing Claude Code conversations into tasks (all of them if no ids are given).
+    Import {
+        /// Session ids, from `ph threads`.
+        ids: Vec<String>,
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
     /// Used by Claude Code hooks to report status. Reads the hook's JSON on stdin.
     #[command(hide = true)]
     Notify {
@@ -119,6 +131,23 @@ async fn main() -> Result<()> {
             },
         },
         Command::Rm { id } => Request::Discard { id },
+        Command::Threads { repo } => Request::Discover { repo: absolute(&repo)? },
+        Command::Import { ids, repo } => {
+            let repo = absolute(&repo)?;
+            let sessions = if ids.is_empty() {
+                // Everything that isn't a task yet.
+                match client::send(&Request::Discover { repo: repo.clone() }).await? {
+                    Response::Discovered { sessions } => {
+                        sessions.into_iter().filter(|s| s.task.is_none()).map(|s| s.id).collect()
+                    }
+                    Response::Error { message } => bail!("daemon: {message}"),
+                    other => bail!("unexpected answer: {other:?}"),
+                }
+            } else {
+                ids
+            };
+            Request::Import { repo, sessions }
+        }
         Command::Notify { .. } => unreachable!("handled above"),
     };
 
@@ -134,6 +163,7 @@ async fn main() -> Result<()> {
         Response::Screen { text, .. } | Response::ScreenText { text } => println!("{text}"),
         Response::Diff { patch, .. } => print!("{patch}"),
         Response::Shipped { message } => println!("{message}"),
+        Response::Discovered { sessions } => print_threads(&sessions),
         Response::Error { message } => bail!("daemon: {message}"),
         other => println!("{other:?}"),
     }
@@ -162,21 +192,42 @@ fn print_tasks(tasks: &[Task]) {
     }
 }
 
+fn absolute(repo: &std::path::Path) -> Result<PathBuf> {
+    repo.canonicalize().with_context(|| format!("repo not found: {}", repo.display()))
+}
+
+fn print_threads(sessions: &[philharmonic_core::FoundSession]) {
+    if sessions.is_empty() {
+        println!("no Claude Code conversations found for this repo");
+        return;
+    }
+    let width = sessions.iter().map(|s| s.branch.len()).max().unwrap_or(0).max("BRANCH".len()) + 2;
+    println!("{:<38}{:<8}{:<width$}TITLE", "SESSION", "TASK", "BRANCH");
+    for s in sessions {
+        let task = match (s.task, s.open_elsewhere) {
+            (Some(id), _) => format!("#{id}"),
+            (None, true) => "open".to_string(),
+            (None, false) => "-".to_string(),
+        };
+        println!("{:<38}{:<8}{:<width$}{}", s.id, task, s.branch, s.title);
+    }
+}
+
 /// Called by Claude Code hooks inside a task's terminal: `$PH_TASK_ID` says which task.
 async fn notify(event: Hook) -> Result<()> {
     let id: TaskId = std::env::var("PH_TASK_ID")?.parse()?;
     // Hooks get a JSON object on stdin; `message` explains Notification events.
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
-    let message = serde_json::from_str::<serde_json::Value>(&input)
-        .ok()
-        .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(str::to_string))
-        .unwrap_or_default();
+    let json = serde_json::from_str::<serde_json::Value>(&input).unwrap_or_default();
+    let text = |key: &str| json.get(key).and_then(|v| v.as_str()).map(str::to_string);
+    let message = text("message").unwrap_or_default();
+    let session_id = text("session_id");
     let event = match event {
         Hook::Running => HookEvent::Running,
         Hook::NeedsInput => HookEvent::NeedsInput,
         Hook::Stopped => HookEvent::Stopped,
     };
-    client::send(&Request::Notify { id, event, message }).await?;
+    client::send(&Request::Notify { id, event, message, session_id }).await?;
     Ok(())
 }

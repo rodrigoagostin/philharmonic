@@ -6,14 +6,15 @@ use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use philharmonic_core::{
-    Agent, ContextId, Event, HookEvent, Request, Response, Scope, ShipMethod, Task, TaskId, TaskStatus, now,
-    paths, slug::slugify,
+    Agent, ContextId, Event, FoundSession, HookEvent, Request, Response, Scope, ShipMethod, Task, TaskId, TaskStatus,
+    now, paths, slug::slugify,
 };
 
 use crate::agent::{self, Start};
 use crate::context_store;
 use crate::daemon::Shared;
 use crate::git;
+use crate::sessions;
 
 pub async fn handle(request: Request, d: &Shared) -> Response {
     match dispatch(request, d).await {
@@ -53,6 +54,13 @@ async fn dispatch(request: Request, d: &Shared) -> Result<Response> {
             } else {
                 Start::Resume
             };
+            // Two Claude Code processes on one conversation would talk over each other.
+            if let Some(session) = &task.session
+                && sessions::open_now().contains(session)
+                && !d.procs.lock().unwrap().contains_key(&id)
+            {
+                bail!("this conversation is open in another terminal. Quit Claude Code there first, then resume it here");
+            }
             Response::Task { task: start_agent(d, &task, start, task.status)? }
         }
         Request::Discard { id } => {
@@ -60,10 +68,13 @@ async fn dispatch(request: Request, d: &Shared) -> Result<Response> {
             agent::kill(d, id);
             // Give the process a moment to let go of its files.
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            // Best effort: a task whose repo or folder is gone must still be discardable.
-            let problems = git::remove(&task.repo, &task.worktree, &task.branch, &paths::worktrees_dir()?).await;
-            for p in &problems {
-                tracing::warn!(task = id, "discard: {p}");
+            // An imported thread lives in your folder, on your branch: only forget it.
+            if !task.adopted {
+                // Best effort: a task whose repo or folder is gone must still be discardable.
+                let problems = git::remove(&task.repo, &task.worktree, &task.branch, &paths::worktrees_dir()?).await;
+                for p in &problems {
+                    tracing::warn!(task = id, "discard: {p}");
+                }
             }
             context_store::remove_for_task(d, id);
             agent::forget_terminal(d, id);
@@ -103,8 +114,8 @@ async fn dispatch(request: Request, d: &Shared) -> Result<Response> {
         }
 
         // ---- hooks ----
-        Request::Notify { id, event, message } => {
-            on_hook(d, id, event, &message);
+        Request::Notify { id, event, message, session_id } => {
+            on_hook(d, id, event, &message, session_id);
             Response::Ok
         }
 
@@ -135,6 +146,10 @@ async fn dispatch(request: Request, d: &Shared) -> Result<Response> {
             context_store::remove(d, id)?;
             Response::Ok
         }
+
+        // ---- existing threads ----
+        Request::Discover { repo } => Response::Discovered { sessions: discover(d, &repo).await? },
+        Request::Import { repo, sessions } => Response::Tasks { tasks: import(d, &repo, &sessions).await? },
 
         // ---- misc ----
         Request::Branches { repo } => Response::Branches { names: git::branches(&repo).await? },
@@ -203,6 +218,8 @@ async fn new_task(
             status: TaskStatus::Queued,
             created_at: now(),
             started: false,
+            session: None,
+            adopted: false,
         };
         state.insert(task.clone());
         task
@@ -256,8 +273,13 @@ fn title_from(prompt: &str) -> String {
 }
 
 /// Claude Code hooks report what the agent is doing.
-fn on_hook(d: &Shared, id: TaskId, event: HookEvent, message: &str) {
+fn on_hook(d: &Shared, id: TaskId, event: HookEvent, message: &str, session_id: Option<String>) {
     d.update_task(id, |t| {
+        // Remember the conversation, to resume exactly this one later. (It changes after
+        // `/clear`, so always take the latest.)
+        if let Some(s) = session_id.filter(|s| !s.is_empty()) {
+            t.session = Some(s);
+        }
         if !t.status.is_live() {
             return; // stopped/done tasks stay as they are
         }
@@ -282,6 +304,13 @@ fn on_hook(d: &Shared, id: TaskId, event: HookEvent, message: &str) {
 }
 
 async fn ship(task: &Task, how: ShipMethod) -> Result<String> {
+    // Imported threads can work right on `main`, or on a detached HEAD.
+    if task.branch == task.base || task.branch == "HEAD" {
+        bail!(
+            "this task works directly on '{}', not on a branch of its own, so there's nothing to merge or open a PR from. Commit and push it yourself",
+            task.branch
+        );
+    }
     let message = format!("{}\n\n{}\n\n(Philharmonic task {})", task.title, task.prompt, task.id);
     git::commit_all(&task.worktree, &message).await?;
     match how {
@@ -294,4 +323,94 @@ async fn ship(task: &Task, how: ShipMethod) -> Result<String> {
             Ok(format!("Merged {} into {}", task.branch, task.base))
         }
     }
+}
+
+/// The Claude Code conversations already started in a repo: in its main checkout, its
+/// worktrees, or their subfolders. Newest first.
+async fn discover(d: &Shared, repo: &std::path::Path) -> Result<Vec<FoundSession>> {
+    let checkouts = git::worktrees(repo).await.with_context(|| format!("{} isn't a git repository", repo.display()))?;
+    let roots = checkouts.clone();
+    let found = tokio::task::spawn_blocking(move || {
+        let mut all: Vec<sessions::Session> = Vec::new();
+        for root in &roots {
+            for s in sessions::find_under(root) {
+                if !all.iter().any(|a| a.id == s.id) {
+                    all.push(s);
+                }
+            }
+        }
+        all
+    })
+    .await?;
+
+    let open = sessions::open_now();
+    let tasks = d.state.lock().unwrap().list();
+    let mut out = Vec::new();
+    for s in found {
+        // A subfolder may be a different repo (one nested inside this one): skip those.
+        match git::toplevel(&s.cwd).await {
+            Ok(top) if checkouts.contains(&top) => {}
+            _ => continue,
+        }
+        let branch = git::current_branch(&s.cwd).await.unwrap_or_else(|_| "HEAD".to_string());
+        let task = tasks
+            .iter()
+            .find(|t| t.session.as_deref() == Some(s.id.as_str()) || (!t.adopted && t.session.is_none() && t.worktree == s.cwd))
+            .map(|t| t.id);
+        out.push(FoundSession {
+            open_elsewhere: open.contains(&s.id),
+            id: s.id,
+            cwd: s.cwd,
+            branch,
+            title: s.title,
+            prompt: s.prompt,
+            prompts: s.prompts,
+            updated_at: s.updated_at,
+            task,
+        });
+    }
+    out.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
+    Ok(out)
+}
+
+/// Turn found conversations into stopped tasks. Ones that are already tasks are skipped.
+async fn import(d: &Shared, repo: &std::path::Path, ids: &[String]) -> Result<Vec<Task>> {
+    let found = discover(d, repo).await?;
+    // Tasks belong to the main checkout (merges go there), whichever folder was picked.
+    let main = git::worktrees(repo).await?.into_iter().next().context("no main checkout")?;
+    let base = git::default_branch(&main).await?;
+
+    let mut created = Vec::new();
+    for id in ids {
+        let f = found.iter().find(|f| &f.id == id).with_context(|| format!("no conversation {id} in this repo"))?;
+        if f.task.is_some() {
+            continue;
+        }
+        let task = {
+            let mut state = d.state.lock().unwrap();
+            let task = Task {
+                id: state.next_id(),
+                title: f.title.clone(),
+                prompt: f.prompt.clone(),
+                repo: main.clone(),
+                base: base.clone(),
+                branch: f.branch.clone(),
+                worktree: f.cwd.clone(),
+                agent: Agent::Claude,
+                model: None,
+                auto_approve: false,
+                status: TaskStatus::Stopped,
+                created_at: f.updated_at,
+                started: true,
+                session: Some(f.id.clone()),
+                adopted: true,
+            };
+            state.insert(task.clone());
+            task
+        };
+        d.emit(Event::TaskUpdated { task: task.clone() });
+        created.push(task);
+    }
+    d.save();
+    Ok(created)
 }

@@ -76,6 +76,9 @@ pub enum Request {
         event: HookEvent,
         #[serde(default)]
         message: String,
+        /// The Claude Code session the hook ran in.
+        #[serde(default)]
+        session_id: Option<String>,
     },
 
     // ---- review & ship ----
@@ -98,6 +101,13 @@ pub enum Request {
     ListContext,
     MoveContext { id: ContextId, scope: Scope },
     RemoveContext { id: ContextId },
+
+    // ---- existing Claude Code threads ----
+    /// Find the Claude Code conversations already started in a repo (its main checkout,
+    /// its worktrees and their subfolders).
+    Discover { repo: PathBuf },
+    /// Turn found conversations into (stopped) tasks you can resume. Ids from `Discover`.
+    Import { repo: PathBuf, sessions: Vec<String> },
 
     // ---- misc ----
     /// Local branches of a repo (for the base-branch picker).
@@ -129,6 +139,29 @@ pub enum ShipMethod {
     Pr,
     /// Commit and merge the branch into the base branch of the main checkout.
     Merge,
+}
+
+/// A Claude Code conversation found on disk (see `Request::Discover`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FoundSession {
+    /// Claude Code's session id (the `.jsonl` file name).
+    pub id: String,
+    /// The folder it runs in.
+    pub cwd: PathBuf,
+    /// The branch checked out there now.
+    pub branch: String,
+    /// Claude's title for it, else the first prompt (shortened).
+    pub title: String,
+    /// The first thing you asked.
+    pub prompt: String,
+    /// How many prompts you typed.
+    pub prompts: u32,
+    /// Last activity, Unix seconds.
+    pub updated_at: u64,
+    /// Open right now in another terminal (resuming it here would run it twice).
+    pub open_elsewhere: bool,
+    /// Already a task here.
+    pub task: Option<TaskId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,6 +198,7 @@ pub enum Response {
     ContextAdded { item: ContextItem },
     Context { items: Vec<ContextItem> },
     Branches { names: Vec<String> },
+    Discovered { sessions: Vec<FoundSession> },
     Event { event: Event },
     Error { message: String },
 }

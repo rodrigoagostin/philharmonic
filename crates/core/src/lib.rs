@@ -10,7 +10,7 @@ pub mod slug;
 pub mod task;
 
 pub use context::{ContextId, ContextItem, ContextKind, Scope};
-pub use protocol::{Event, FileChange, HookEvent, Request, Response, ShipMethod};
+pub use protocol::{Event, FileChange, FoundSession, HookEvent, Request, Response, ShipMethod};
 pub use task::{Agent, Task, TaskId, TaskStatus};
 
 /// Seconds since 1970 (for `created_at` fields).

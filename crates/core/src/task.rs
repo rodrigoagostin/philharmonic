@@ -38,6 +38,14 @@ pub struct Task {
     /// that doesn't exist. Tasks saved before this field existed count as started.
     #[serde(default = "yes")]
     pub started: bool,
+    /// The Claude Code conversation (session id). Resuming uses `--resume <id>`, so the
+    /// right conversation comes back even if a folder has several.
+    #[serde(default)]
+    pub session: Option<String>,
+    /// Imported from an existing Claude Code thread: the folder and branch are yours, not
+    /// Philharmonic's, so discarding the task only forgets it (nothing is deleted).
+    #[serde(default)]
+    pub adopted: bool,
 }
 
 fn yes() -> bool {

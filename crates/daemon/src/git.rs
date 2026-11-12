@@ -96,6 +96,45 @@ async fn git_with_index(dir: &Path, args: &[&str], index: Option<&Path>) -> Resu
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Every checkout of a repo: the main one first, then its linked worktrees. Folders that
+/// no longer exist are left out. Paths are canonical.
+pub async fn worktrees(repo: &Path) -> Result<Vec<PathBuf>> {
+    let out = git(repo, &["worktree", "list", "--porcelain"]).await?;
+    Ok(out
+        .lines()
+        .filter_map(|l| l.strip_prefix("worktree "))
+        .filter_map(|p| Path::new(p).canonicalize().ok())
+        .collect())
+}
+
+/// The top folder of the checkout `dir` is in (canonical).
+pub async fn toplevel(dir: &Path) -> Result<PathBuf> {
+    let top = git(dir, &["rev-parse", "--show-toplevel"]).await?;
+    Ok(Path::new(top.trim()).canonicalize()?)
+}
+
+/// The branch checked out in `dir` (`HEAD` if detached).
+pub async fn current_branch(dir: &Path) -> Result<String> {
+    Ok(git(dir, &["rev-parse", "--abbrev-ref", "HEAD"]).await?.trim().to_string())
+}
+
+/// The branch work usually merges into: the remote's default, else `main`/`master`,
+/// else whatever the main checkout is on.
+pub async fn default_branch(repo: &Path) -> Result<String> {
+    if let Ok(head) = git(repo, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]).await
+        && let Some(name) = head.trim().strip_prefix("origin/")
+        && branch_exists(repo, name).await.unwrap_or(false)
+    {
+        return Ok(name.to_string());
+    }
+    for name in ["main", "master"] {
+        if branch_exists(repo, name).await? {
+            return Ok(name.to_string());
+        }
+    }
+    current_branch(repo).await
+}
+
 /// Local branch names, e.g. `["main", "develop"]`.
 pub async fn branches(repo: &Path) -> Result<Vec<String>> {
     let out = git(repo, &["for-each-ref", "--format=%(refname:short)", "refs/heads"]).await?;

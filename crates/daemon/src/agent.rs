@@ -194,7 +194,11 @@ fn command_for(d: &Shared, task: &Task, start: Start) -> Result<CommandBuilder> 
             match start {
                 // `--` so a prompt starting with `-` isn't read as a flag.
                 Start::Fresh { prompt } => cmd.args(["--", &prompt]),
-                Start::Resume => cmd.arg("--continue"),
+                // The exact conversation if we know it, else the folder's latest.
+                Start::Resume => match &task.session {
+                    Some(session) => cmd.args(["--resume", session]),
+                    None => cmd.arg("--continue"),
+                },
             }
             cmd
         }

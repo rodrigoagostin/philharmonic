@@ -8,6 +8,7 @@ mod context_store;
 mod daemon;
 mod git;
 mod handlers;
+mod sessions;
 mod state;
 
 use std::collections::HashMap;
