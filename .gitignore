@@ -1,0 +1,6 @@
+/target
+/.e2e
+/app/node_modules
+/app/dist
+/app/src-tauri/gen
+/app/src-tauri/binaries
