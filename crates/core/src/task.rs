@@ -33,6 +33,15 @@ pub struct Task {
     /// Unix seconds.
     #[serde(default)]
     pub created_at: u64,
+    /// Has the agent received its first prompt (a Claude Code hook fired)? If not, a
+    /// resume gives it the prompt again instead of `--continue`-ing a conversation
+    /// that doesn't exist. Tasks saved before this field existed count as started.
+    #[serde(default = "yes")]
+    pub started: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// Which program runs inside the task's terminal.

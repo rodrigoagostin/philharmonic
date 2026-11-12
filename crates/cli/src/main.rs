@@ -106,7 +106,7 @@ async fn main() -> Result<()> {
             Request::NewTask { prompt, repo, base, agent, model, auto_approve, context: vec![] }
         }
         Command::Ls => Request::ListTasks,
-        Command::Show { id } => Request::Screen { id },
+        Command::Show { id } => Request::ScreenText { id },
         Command::Send { id, text } => Request::Send { id, text, context: vec![] },
         Command::Stop { id } => Request::Stop { id },
         Command::Resume { id } => Request::Resume { id },
@@ -131,7 +131,7 @@ async fn main() -> Result<()> {
         }
         Response::Task { task } => println!("task {}: {}", task.id, task.status),
         Response::Tasks { tasks } => print_tasks(&tasks),
-        Response::Screen { text, .. } => println!("{text}"),
+        Response::Screen { text, .. } | Response::ScreenText { text } => println!("{text}"),
         Response::Diff { patch, .. } => print!("{patch}"),
         Response::Shipped { message } => println!("{message}"),
         Response::Error { message } => bail!("daemon: {message}"),

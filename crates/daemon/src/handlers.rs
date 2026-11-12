@@ -45,15 +45,26 @@ async fn dispatch(request: Request, d: &Shared) -> Result<Response> {
         }
         Request::Resume { id } => {
             let task = existing(d, id)?;
-            agent::spawn(d, &task, Start::Resume)?;
-            Response::Task { task: set_status(d, id, TaskStatus::Running)? }
+            // Claude Code can only `--continue` a conversation that exists. If the first
+            // prompt never got through (stopped at the trust question, daemon restarted,
+            // first start failed…), give it the prompt again.
+            let start = if task.agent == Agent::Claude && !task.started {
+                Start::Fresh { prompt: first_prompt(&task.prompt, &task_context(d, id)) }
+            } else {
+                Start::Resume
+            };
+            Response::Task { task: start_agent(d, &task, start, task.status)? }
         }
         Request::Discard { id } => {
             let task = existing(d, id)?;
             agent::kill(d, id);
             // Give the process a moment to let go of its files.
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            git::remove(&task.repo, &task.worktree, &task.branch).await?;
+            // Best effort: a task whose repo or folder is gone must still be discardable.
+            let problems = git::remove(&task.repo, &task.worktree, &task.branch, &paths::worktrees_dir()?).await;
+            for p in &problems {
+                tracing::warn!(task = id, "discard: {p}");
+            }
             context_store::remove_for_task(d, id);
             agent::forget_terminal(d, id);
             d.state.lock().unwrap().remove(id);
@@ -71,7 +82,7 @@ async fn dispatch(request: Request, d: &Shared) -> Result<Response> {
         // ---- terminal ----
         Request::Input { id, data } => {
             let bytes = B64.decode(data.as_bytes()).context("input isn't valid base64")?;
-            agent::write(d, id, &bytes)?;
+            agent::write(d, id, bytes).await?;
             Response::Ok
         }
         Request::Resize { id, cols, rows } => {
@@ -79,9 +90,10 @@ async fn dispatch(request: Request, d: &Shared) -> Result<Response> {
             Response::Ok
         }
         Request::Screen { id } => {
-            let (history, text) = agent::screen(d, id);
-            Response::Screen { history, text }
+            let (history, text, end) = agent::screen(d, id);
+            Response::Screen { history, text, end }
         }
+        Request::ScreenText { id } => Response::ScreenText { text: agent::screen_text(d, id) },
         Request::Send { id, text, context } => {
             existing(d, id)?;
             let items = context_store::get(d, &context);
@@ -152,6 +164,9 @@ async fn new_task(
     if prompt.trim().is_empty() {
         bail!("the prompt is empty");
     }
+    // One spelling per repo (`/tmp/x` and `/private/tmp/x` are the same repo), whichever
+    // client sent it, so filters and project context line up.
+    let repo = std::fs::canonicalize(&repo).with_context(|| format!("repo not found: {}", repo.display()))?;
 
     // Names. If the branch or folder is taken (same prompt twice), try `-2`, `-3`, …
     let base_slug = slugify(&prompt, 40);
@@ -187,6 +202,7 @@ async fn new_task(
             auto_approve,
             status: TaskStatus::Queued,
             created_at: now(),
+            started: false,
         };
         state.insert(task.clone());
         task
@@ -199,13 +215,34 @@ async fn new_task(
         let _ = context_store::move_to(d, *id, Scope::Task { id: task.id });
     }
     let items = context_store::get(d, &context);
-    let first_prompt = format!("{}{}", prompt.trim(), context_store::describe(&items));
+    let start = Start::Fresh { prompt: first_prompt(&prompt, &items) };
+    start_agent(d, &task, start, TaskStatus::Failed)
+        .map_err(|e| e.context("the worktree was created, but the agent couldn't start"))
+}
 
-    if let Err(e) = agent::spawn(d, &task, Start::Fresh { prompt: first_prompt }) {
-        set_status(d, task.id, TaskStatus::Failed)?;
-        return Err(e.context("the worktree was created, but the agent couldn't start"));
+/// Mark the task running, then start its agent. In that order: the agent may report
+/// "needs you" (or exit) right away, and that must not be overwritten by "running".
+/// If it can't start, the status becomes `on_error`.
+fn start_agent(d: &Shared, task: &Task, start: Start, on_error: TaskStatus) -> Result<Task> {
+    if d.procs.lock().unwrap().contains_key(&task.id) {
+        bail!("task {} is already running", task.id);
     }
-    set_status(d, task.id, TaskStatus::Running)
+    let running = set_status(d, task.id, TaskStatus::Running)?;
+    if let Err(e) = agent::spawn(d, task, start) {
+        set_status(d, task.id, on_error)?;
+        return Err(e);
+    }
+    Ok(running)
+}
+
+/// The prompt plus the list of attached context.
+fn first_prompt(prompt: &str, items: &[philharmonic_core::ContextItem]) -> String {
+    format!("{}{}", prompt.trim(), context_store::describe(items))
+}
+
+/// Context items that belong to a task.
+fn task_context(d: &Shared, id: TaskId) -> Vec<philharmonic_core::ContextItem> {
+    context_store::list(d).into_iter().filter(|i| i.scope == Scope::Task { id }).collect()
 }
 
 /// First line of the prompt, shortened for lists.
@@ -223,6 +260,11 @@ fn on_hook(d: &Shared, id: TaskId, event: HookEvent, message: &str) {
     d.update_task(id, |t| {
         if !t.status.is_live() {
             return; // stopped/done tasks stay as they are
+        }
+        // Hooks only fire once Claude Code has taken the prompt, so from now on there's a
+        // conversation to `--continue`.
+        if matches!(event, HookEvent::Running | HookEvent::Stopped) {
+            t.started = true;
         }
         t.status = match event {
             HookEvent::Running => TaskStatus::Running,

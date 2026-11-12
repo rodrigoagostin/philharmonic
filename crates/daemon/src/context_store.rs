@@ -19,13 +19,34 @@ fn scope_dir(scope: &Scope) -> Result<PathBuf> {
     Ok(paths::context_dir()?.join(name))
 }
 
-/// Keep the extension, make the rest safe for a file name.
+/// Keep the extension (if it's a plain one), make the rest safe for a file name.
 fn safe_file_name(name: &str, fallback_ext: &str) -> String {
     let (stem, ext) = match name.rsplit_once('.') {
-        Some((stem, ext)) if !stem.is_empty() && ext.len() <= 8 => (stem, ext.to_ascii_lowercase()),
+        Some((stem, ext))
+            if !stem.is_empty() && !ext.is_empty() && ext.len() <= 8 && ext.chars().all(|c| c.is_ascii_alphanumeric()) =>
+        {
+            (stem, ext.to_ascii_lowercase())
+        }
         _ => (name, fallback_ext.to_string()),
     };
     format!("{}.{}", slugify(stem, 60), ext)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_file_name;
+
+    #[test]
+    fn keeps_plain_extensions() {
+        assert_eq!(safe_file_name("Screenshot 2026-11-12.PNG", "png"), "screenshot-2026-11-12.png");
+    }
+
+    #[test]
+    fn odd_extensions_fall_back() {
+        assert_eq!(safe_file_name("x.a/b", "bin"), "x-a-b.bin");
+        assert_eq!(safe_file_name("notes.", "bin"), "notes.bin");
+        assert_eq!(safe_file_name("no extension", "bin"), "no-extension.bin");
+    }
 }
 
 pub fn add(

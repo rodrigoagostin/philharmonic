@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use philharmonic_core::{Request, Response, paths};
+use philharmonic_core::{Event, Request, Response, paths};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
@@ -73,15 +73,22 @@ async fn run() -> Result<()> {
     loop {
         // `select!` waits for whichever happens first: a new client, Ctrl+C, or `kill`.
         tokio::select! {
-            accepted = listener.accept() => {
-                let (stream, _addr) = accepted?;
-                let d = Arc::clone(&d);
-                tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, d).await {
-                        tracing::debug!("connection closed: {e:#}");
-                    }
-                });
-            }
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _addr)) => {
+                    let d = Arc::clone(&d);
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_connection(stream, d).await {
+                            tracing::debug!("connection closed: {e:#}");
+                        }
+                    });
+                }
+                // One failed connection (e.g. too many open files) must not take the whole
+                // daemon down. Pause briefly so a persistent error doesn't spin the CPU.
+                Err(e) => {
+                    tracing::warn!("accepting a connection: {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            },
             _ = tokio::signal::ctrl_c() => break,
             _ = sigterm.recv() => break,
         }
@@ -107,9 +114,7 @@ async fn handle_connection(stream: UnixStream, d: Shared) -> Result<()> {
         let response = match serde_json::from_str::<Request>(&line) {
             Ok(Request::Subscribe) => return stream_events(writer, d).await,
             Ok(request) => {
-                if !matches!(request, Request::Input { .. } | Request::Screen { .. } | Request::Resize { .. }) {
-                    tracing::info!(?request, "request");
-                }
+                log_request(&request);
                 handlers::handle(request, &d).await
             }
             Err(e) => Response::Error { message: format!("bad request: {e}") },
@@ -119,14 +124,27 @@ async fn handle_connection(stream: UnixStream, d: Shared) -> Result<()> {
     Ok(())
 }
 
+/// Log requests, but not the very frequent ones, and never file contents (a pasted
+/// screenshot is megabytes of base64).
+fn log_request(request: &Request) {
+    match request {
+        Request::Input { .. } | Request::Screen { .. } | Request::ScreenText { .. } | Request::Resize { .. } => {}
+        Request::AddContext { scope, kind, name, .. } => tracing::info!(?scope, ?kind, name, "request: add_context"),
+        other => tracing::info!(request = ?other, "request"),
+    }
+}
+
 async fn stream_events(mut writer: tokio::net::unix::OwnedWriteHalf, d: Shared) -> Result<()> {
     let mut rx = d.events.subscribe();
     write_line(&mut writer, &Response::Ok).await?;
     loop {
         match rx.recv().await {
             Ok(event) => write_line(&mut writer, &Response::Event { event }).await?,
-            // A slow client missed some events; keep going (it can re-sync with list calls).
-            Err(broadcast::error::RecvError::Lagged(n)) => tracing::warn!("subscriber lagged by {n} events"),
+            // A slow client missed some events: tell it to reload.
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!("subscriber lagged by {n} events");
+                write_line(&mut writer, &Response::Event { event: Event::Resync }).await?;
+            }
             Err(broadcast::error::RecvError::Closed) => return Ok(()),
         }
     }
@@ -157,16 +175,39 @@ fn which(name: &str) -> Option<String> {
 }
 
 /// Apps started from the Dock get a minimal PATH, so `claude`, `gh`, etc. wouldn't be found.
-/// Ask your login shell for its PATH and add it to ours.
+/// Ask your login shell for its PATH and add it to ours. Gives up after a few seconds, in
+/// case your shell startup files wait for something.
 fn adopt_login_shell_path() {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-    let output = std::process::Command::new(&shell)
+    let child = Command::new(&shell)
         .args(["-ilc", "printf '__PH__%s__PH__' \"$PATH\""])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output();
-    let Ok(output) = output else { return };
-    let text = String::from_utf8_lossy(&output.stdout);
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn();
+    let Ok(mut child) = child else { return };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            _ => {
+                eprintln!("your login shell took too long to print its PATH; using the current PATH");
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            }
+        }
+    }
+    let mut stdout = Vec::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_end(&mut stdout);
+    }
+    let text = String::from_utf8_lossy(&stdout);
     let Some(login_path) = text.split("__PH__").nth(1) else { return };
     let current = std::env::var("PATH").unwrap_or_default();
     // SAFETY: called from `main` before any other thread is started.

@@ -60,6 +60,8 @@ pub enum Request {
     Resize { id: TaskId, cols: u16, rows: u16 },
     /// Current terminal contents: full byte history (to replay) + visible text.
     Screen { id: TaskId },
+    /// Just the visible text (cheap: no history). For previews.
+    ScreenText { id: TaskId },
     /// Type a message into the agent (pasted, then Enter), with context items attached.
     Send {
         id: TaskId,
@@ -149,7 +151,11 @@ pub enum Response {
         history: String,
         /// The visible screen as plain text, trailing blank lines removed.
         text: String,
+        /// Stream position right after the last byte of `history` (see `Event::Output::offset`).
+        #[serde(default)]
+        end: u64,
     },
+    ScreenText { text: String },
     Diff {
         files: Vec<FileChange>,
         /// Unified diff against the point where the branch left `base`.
@@ -169,9 +175,17 @@ pub enum Response {
 pub enum Event {
     TaskUpdated { task: Task },
     TaskRemoved { id: TaskId },
-    /// New terminal output (base64).
-    Output { id: TaskId, data: String },
+    /// New terminal output (base64). `offset` is the position of its first byte in the
+    /// task's output stream, so clients can drop bytes they already have and notice gaps.
+    Output {
+        id: TaskId,
+        data: String,
+        #[serde(default)]
+        offset: u64,
+    },
     ContextChanged,
+    /// This subscriber missed events: reload everything.
+    Resync,
 }
 
 #[cfg(test)]

@@ -7,6 +7,7 @@
 use std::io::{Read, Write};
 use std::num::NonZeroU16;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -18,12 +19,19 @@ use crate::daemon::Shared;
 
 /// Max bytes of output we keep per task (older output is dropped).
 const HISTORY_CAP: usize = 2 * 1024 * 1024;
+/// Let the history grow this much past the cap before trimming, so we don't move 2 MB
+/// of memory on every single chunk.
+const HISTORY_SLACK: usize = 256 * 1024;
 const DEFAULT_COLS: u16 = 120;
 const DEFAULT_ROWS: u16 = 40;
 
+/// Shared so a write can happen without holding the `procs` lock (a write blocks if the
+/// agent isn't reading its input).
+type Writer = Arc<Mutex<Box<dyn Write + Send>>>;
+
 /// A live agent process.
 pub struct Proc {
-    writer: Box<dyn Write + Send>,
+    writer: Writer,
     master: Box<dyn MasterPty + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
     /// Set when *we* stop it, so an exit isn't reported as a failure.
@@ -34,21 +42,38 @@ pub struct Proc {
 /// (to show plain-text previews).
 pub struct Terminal {
     history: Vec<u8>,
+    /// Bytes ever fed (the stream position after the last byte of `history`).
+    total: u64,
     parser: vt100::Parser,
 }
 
 impl Terminal {
     fn new() -> Terminal {
-        Terminal { history: Vec::new(), parser: vt100::Parser::new(nz(DEFAULT_ROWS), nz(DEFAULT_COLS), 0) }
+        Terminal { history: Vec::new(), total: 0, parser: vt100::Parser::new(nz(DEFAULT_ROWS), nz(DEFAULT_COLS), 0) }
     }
 
-    fn feed(&mut self, bytes: &[u8]) {
+    /// Add output. Returns the stream offset of its first byte.
+    fn feed(&mut self, bytes: &[u8]) -> u64 {
+        let offset = self.total;
+        self.total += bytes.len() as u64;
         self.parser.process(bytes);
         self.history.extend_from_slice(bytes);
-        if self.history.len() > HISTORY_CAP {
-            let cut = self.history.len() - HISTORY_CAP;
+        if self.history.len() > HISTORY_CAP + HISTORY_SLACK {
+            // Cut just after a newline, so the replay doesn't start in the middle of an
+            // escape sequence or a multi-byte character.
+            let mut cut = self.history.len() - HISTORY_CAP;
+            if let Some(nl) = self.history[cut..].iter().position(|&b| b == b'\n') {
+                cut += nl + 1;
+            }
             self.history.drain(..cut);
         }
+        offset
+    }
+
+    /// (rows, cols) the terminal was last sized to.
+    fn size(&self) -> (u16, u16) {
+        let (rows, cols) = self.parser.screen().size();
+        (rows.get(), cols.get())
     }
 
     /// The visible screen as text, without trailing blank lines.
@@ -83,8 +108,12 @@ pub fn spawn(d: &Shared, task: &Task, start: Start) -> Result<()> {
     }
 
     let cmd = command_for(d, task, start)?;
+    // Reuse the size the app last gave this task's terminal (a resume would otherwise
+    // start at 120x40 inside a window of a different size).
+    let id = task.id;
+    let (rows, cols) = d.terms.lock().unwrap().entry(id).or_insert_with(Terminal::new).size();
     let pair = native_pty_system()
-        .openpty(PtySize { rows: DEFAULT_ROWS, cols: DEFAULT_COLS, pixel_width: 0, pixel_height: 0 })
+        .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
         .context("opening a pseudo-terminal")?;
     let mut child = pair.slave.spawn_command(cmd).context("starting the agent")?;
     drop(pair.slave); // the child has its own handle now
@@ -93,8 +122,7 @@ pub fn spawn(d: &Shared, task: &Task, start: Start) -> Result<()> {
     let writer = pair.master.take_writer()?;
     let killer = child.clone_killer();
 
-    let id = task.id;
-    d.terms.lock().unwrap().entry(id).or_insert_with(Terminal::new);
+    let writer = Arc::new(Mutex::new(writer));
     d.procs.lock().unwrap().insert(id, Proc { writer, master: pair.master, killer, stopping: false });
 
     // Reading a PTY blocks, so it gets a plain OS thread rather than an async task.
@@ -108,12 +136,14 @@ pub fn spawn(d: &Shared, task: &Task, start: Start) -> Result<()> {
                     let chunk = &buf[..n];
                     let asking = match reader_daemon.terms.lock().unwrap().get_mut(&id) {
                         Some(term) => {
-                            term.feed(chunk);
+                            let offset = term.feed(chunk);
+                            // Emitted while holding the lock, so events go out in the same
+                            // order as the offsets.
+                            reader_daemon.emit(Event::Output { id, data: B64.encode(chunk), offset });
                             looks_like_a_question(&term.text())
                         }
                         None => false,
                     };
-                    reader_daemon.emit(Event::Output { id, data: B64.encode(chunk) });
                     if asking {
                         let status = reader_daemon.task(id).map(|t| t.status);
                         if matches!(status, Some(TaskStatus::Queued | TaskStatus::Running)) {
@@ -162,7 +192,8 @@ fn command_for(d: &Shared, task: &Task, start: Start) -> Result<CommandBuilder> 
                 cmd.args(["--permission-mode", "acceptEdits"]);
             }
             match start {
-                Start::Fresh { prompt } => cmd.arg(prompt),
+                // `--` so a prompt starting with `-` isn't read as a flag.
+                Start::Fresh { prompt } => cmd.args(["--", &prompt]),
                 Start::Resume => cmd.arg("--continue"),
             }
             cmd
@@ -170,8 +201,14 @@ fn command_for(d: &Shared, task: &Task, start: Start) -> Result<CommandBuilder> 
         Agent::Custom { command } => {
             let mut cmd = CommandBuilder::new("sh");
             cmd.args(["-c", command]);
-            if let Start::Fresh { prompt } = start {
-                cmd.env("PH_PROMPT", prompt);
+            // A custom command can't continue a conversation, so it always gets the
+            // prompt; `$PH_RESUME` tells it whether this is a re-run.
+            match start {
+                Start::Fresh { prompt } => cmd.env("PH_PROMPT", prompt),
+                Start::Resume => {
+                    cmd.env("PH_PROMPT", &task.prompt);
+                    cmd.env("PH_RESUME", "1");
+                }
             }
             cmd
         }
@@ -213,12 +250,21 @@ fn hook_settings(ph: &Path) -> String {
 
 // ---- talking to a running agent ----
 
-pub fn write(d: &Shared, id: TaskId, bytes: &[u8]) -> Result<()> {
-    let mut procs = d.procs.lock().unwrap();
-    let proc = procs.get_mut(&id).context("the agent isn't running (resume it first)")?;
-    proc.writer.write_all(bytes)?;
-    proc.writer.flush()?;
-    Ok(())
+/// Type bytes into the agent's terminal. The write itself runs on a blocking thread and
+/// doesn't hold the `procs` lock, so an agent that stops reading can't freeze the daemon.
+pub async fn write(d: &Shared, id: TaskId, bytes: Vec<u8>) -> Result<()> {
+    let writer = {
+        let procs = d.procs.lock().unwrap();
+        let proc = procs.get(&id).context("the agent isn't running (resume it first)")?;
+        Arc::clone(&proc.writer)
+    };
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut w = writer.lock().unwrap();
+        w.write_all(&bytes)?;
+        w.flush()?;
+        Ok(())
+    })
+    .await?
 }
 
 pub fn resize(d: &Shared, id: TaskId, cols: u16, rows: u16) -> Result<()> {
@@ -231,12 +277,17 @@ pub fn resize(d: &Shared, id: TaskId, cols: u16, rows: u16) -> Result<()> {
     Ok(())
 }
 
-/// (history as base64, visible text)
-pub fn screen(d: &Shared, id: TaskId) -> (String, String) {
+/// (history as base64, visible text, stream position after the history)
+pub fn screen(d: &Shared, id: TaskId) -> (String, String, u64) {
     match d.terms.lock().unwrap().get(&id) {
-        Some(term) => (B64.encode(&term.history), term.text()),
-        None => (String::new(), String::new()),
+        Some(term) => (B64.encode(&term.history), term.text(), term.total),
+        None => (String::new(), String::new(), 0),
     }
+}
+
+/// Just the visible text.
+pub fn screen_text(d: &Shared, id: TaskId) -> String {
+    d.terms.lock().unwrap().get(&id).map(|t| t.text()).unwrap_or_default()
 }
 
 /// Type a message the way a person pastes it, then press Enter.
@@ -246,9 +297,9 @@ pub async fn send_message(d: &Shared, id: TaskId, text: &str) -> Result<()> {
     let mut paste = b"\x1b[200~".to_vec();
     paste.extend_from_slice(text.as_bytes());
     paste.extend_from_slice(b"\x1b[201~");
-    write(d, id, &paste)?;
+    write(d, id, paste).await?;
     tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-    write(d, id, b"\r")
+    write(d, id, b"\r".to_vec()).await
 }
 
 /// Ask the agent's process to stop.
