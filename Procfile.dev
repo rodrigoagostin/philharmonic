@@ -1,0 +1,3 @@
+# Used by `:Run` in Neovim (and by foreman/overmind/honcho). One process per line: name: command
+# One process: `tauri dev` builds the daemon + CLI first, then opens the window, which starts the daemon.
+app: cd app && npm run tauri dev
