@@ -239,6 +239,15 @@ export function NewTaskModal() {
           <span className="small muted grow">
             The first time, Claude Code asks whether you trust the new folder. Answer it from the task card.
           </span>
+          <button
+            className="link-btn small"
+            onClick={() => {
+              cancel();
+              s.setImportOpen(true);
+            }}
+          >
+            Open existing threads instead
+          </button>
           <button className="btn" onClick={cancel}>
             Cancel
           </button>

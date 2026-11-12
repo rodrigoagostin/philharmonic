@@ -24,6 +24,8 @@ interface Store {
   go: (view: View) => void;
   newTaskOpen: boolean;
   setNewTaskOpen: (open: boolean) => void;
+  importOpen: boolean;
+  setImportOpen: (open: boolean) => void;
   repoFilter: string | null;
   setRepoFilter: (repo: string | null) => void;
   search: string;
@@ -51,6 +53,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [connectionError, setConnectionError] = useState<string>();
   const [view, setView] = useState<View>({ name: "stage" });
   const [newTaskOpen, setNewTaskOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
   const [repoFilter, setRepoFilter] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -148,6 +151,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     go: setView,
     newTaskOpen,
     setNewTaskOpen,
+    importOpen,
+    setImportOpen,
     repoFilter,
     setRepoFilter,
     search,

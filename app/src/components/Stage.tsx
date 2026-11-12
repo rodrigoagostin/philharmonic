@@ -35,9 +35,16 @@ export function Stage() {
       {tasks.length === 0 ? (
         <div className="empty">
           <p>{q ? "No tasks match your search." : "Nothing on stage. Start a task and the agent gets its own worktree."}</p>
-          <button className="btn btn-primary" onClick={() => s.setNewTaskOpen(true)}>
-            <Icon name="plus" /> New task
-          </button>
+          <div className="row" style={{ justifyContent: "center" }}>
+            <button className="btn btn-primary" onClick={() => s.setNewTaskOpen(true)}>
+              <Icon name="plus" /> New task
+            </button>
+            {!q && (
+              <button className="btn" onClick={() => s.setImportOpen(true)}>
+                <Icon name="import" /> Open existing threads
+              </button>
+            )}
+          </div>
         </div>
       ) : (
         <div className="cards">

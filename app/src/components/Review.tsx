@@ -82,6 +82,9 @@ export function Review({ task }: { task: Task }) {
   const [confirmDiscard, setConfirmDiscard] = useState(false);
   const live = LIVE.includes(task.status);
   const shipped = task.status === "done";
+  // Imported threads may work right on the base branch: nothing to merge or PR from.
+  const onBase = task.branch === task.base || task.branch === "HEAD";
+  const shipTitle = onBase ? `This task works directly on ${task.branch}: commit and push it yourself` : undefined;
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -132,7 +135,7 @@ export function Review({ task }: { task: Task }) {
   async function discard() {
     const ok = await s.run(() => api.discard(task.id));
     if (ok !== undefined) {
-      s.toast(`Discarded task ${task.id}`);
+      s.toast(task.adopted ? `Removed task ${task.id} (your folder and branch are untouched)` : `Discarded task ${task.id}`);
       s.go({ name: "stage" });
     }
   }
@@ -160,20 +163,20 @@ export function Review({ task }: { task: Task }) {
         </button>
         {confirmDiscard ? (
           <button className="btn btn-danger-solid" onClick={discard} onBlur={() => setConfirmDiscard(false)} autoFocus>
-            Really discard?
+            {task.adopted ? "Remove from Stage? (files stay)" : "Really discard?"}
           </button>
         ) : (
           <button className="btn btn-danger" onClick={() => setConfirmDiscard(true)}>
-            Discard…
+            {task.adopted ? "Remove…" : "Discard…"}
           </button>
         )}
         <button className="btn btn-attention" disabled={!comments.length || !live} onClick={sendComments}>
           Send {comments.length} comment{comments.length === 1 ? "" : "s"} to agent
         </button>
-        <button className="btn" disabled={busy || shipped || !files.length} onClick={() => ship("merge")}>
+        <button className="btn" disabled={busy || shipped || onBase || !files.length} title={shipTitle} onClick={() => ship("merge")}>
           Merge locally
         </button>
-        <button className="btn btn-primary" disabled={busy || shipped || !files.length} onClick={() => ship("pr")}>
+        <button className="btn btn-primary" disabled={busy || shipped || onBase || !files.length} title={shipTitle} onClick={() => ship("pr")}>
           Create PR
         </button>
       </header>

@@ -1057,3 +1057,43 @@ textarea {
   gap: 6px;
   cursor: pointer;
 }
+
+/* ---- import existing threads ---- */
+.thread-list {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  max-height: 360px;
+  overflow: auto;
+}
+.thread-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border-soft);
+  cursor: pointer;
+}
+.thread-row:last-child {
+  border-bottom: 0;
+}
+.thread-row:hover {
+  background: var(--panel-2);
+}
+.thread-row input {
+  margin-top: 3px;
+}
+.thread-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.thread-main p {
+  margin: 0;
+}
+.thread-done {
+  cursor: default;
+  opacity: 0.7;
+}

@@ -7,6 +7,7 @@ import { Focus } from "./components/Focus";
 import { Review } from "./components/Review";
 import { ContextShelf } from "./components/ContextShelf";
 import { NewTaskModal } from "./components/NewTaskModal";
+import { ImportModal } from "./components/ImportModal";
 import { StatusBar } from "./components/StatusBar";
 import { Toasts } from "./components/Toasts";
 
@@ -34,7 +35,7 @@ export function App() {
       } else if (e.metaKey && e.key === "0") {
         e.preventDefault();
         s.go({ name: "stage" });
-      } else if (e.key === "Escape" && !inTerminal && !s.newTaskOpen && s.view.name !== "stage") {
+      } else if (e.key === "Escape" && !inTerminal && !s.newTaskOpen && !s.importOpen && s.view.name !== "stage") {
         s.go({ name: "stage" });
       }
     }
@@ -64,6 +65,7 @@ export function App() {
       </div>
       <StatusBar />
       {s.newTaskOpen && <NewTaskModal />}
+      {s.importOpen && <ImportModal initialRepo={s.repoFilter ?? undefined} />}
       <Toasts />
     </div>
   );

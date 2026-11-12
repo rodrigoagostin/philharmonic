@@ -18,7 +18,7 @@ export function Focus({ task }: { task: Task }) {
   async function discard() {
     const ok = await s.run(() => api.discard(task.id));
     if (ok !== undefined) {
-      s.toast(`Discarded task ${task.id}`);
+      s.toast(task.adopted ? `Removed task ${task.id} (your folder and branch are untouched)` : `Discarded task ${task.id}`);
       s.go({ name: "stage" });
     }
   }
@@ -100,7 +100,7 @@ export function Focus({ task }: { task: Task }) {
               <dd className="mono selectable">
                 {task.branch} ← {task.base}
               </dd>
-              <dt>Worktree</dt>
+              <dt>{task.adopted ? "Folder" : "Worktree"}</dt>
               <dd className="mono selectable">{task.worktree}</dd>
               <dt>Agent</dt>
               <dd>
@@ -144,11 +144,11 @@ export function Focus({ task }: { task: Task }) {
               </button>
               {confirmDiscard ? (
                 <button className="btn btn-danger-solid" onClick={discard} onBlur={() => setConfirmDiscard(false)} autoFocus>
-                  Really delete worktree + branch?
+                  {task.adopted ? "Remove from Stage? (files stay)" : "Really delete worktree + branch?"}
                 </button>
               ) : (
                 <button className="btn btn-danger" onClick={() => setConfirmDiscard(true)}>
-                  Discard…
+                  {task.adopted ? "Remove…" : "Discard…"}
                 </button>
               )}
             </div>

@@ -15,6 +15,7 @@ const PATHS: Record<string, string> = {
   clipboard: "M9 4h6v3H9zM7 5H5v16h14V5h-2",
   baton: "M4 20L18 6M16 4l4 4M3 21l2-2",
   diff: "M7 4v10M2 9h10M14 18h8M17 4v6M14 7h6",
+  import: "M12 4v11M7 10l5 5 5-5M5 20h14",
 };
 
 export function Icon({ name, size = 16 }: { name: string; size?: number }) {

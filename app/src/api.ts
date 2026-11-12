@@ -19,6 +19,25 @@ export interface Task {
   auto_approve: boolean;
   status: TaskStatus;
   created_at: number;
+  /** Claude Code conversation id (resume uses it). */
+  session: string | null;
+  /** Imported from an existing thread: folder and branch aren't Philharmonic's. */
+  adopted: boolean;
+}
+
+/** A Claude Code conversation found in a repo (see `api.discover`). */
+export interface FoundSession {
+  id: string;
+  cwd: string;
+  branch: string;
+  title: string;
+  prompt: string;
+  prompts: number;
+  updated_at: number;
+  /** Open right now in another terminal. */
+  open_elsewhere: boolean;
+  /** Already a task here. */
+  task: number | null;
 }
 
 export type Scope = { kind: "task"; id: number } | { kind: "project"; repo: string } | { kind: "inbox" };
@@ -98,6 +117,11 @@ export const api = {
   moveContext: (id: number, scope: Scope) => request({ type: "move_context", id, scope }),
   removeContext: (id: number) => request({ type: "remove_context", id }),
   branches: async (repo: string) => (await request<{ names: string[] }>({ type: "branches", repo })).names,
+  /** Claude Code conversations already started in a repo, newest first. */
+  discover: async (repo: string) => (await request<{ sessions: FoundSession[] }>({ type: "discover", repo })).sessions,
+  /** Turn found conversations into (stopped) tasks. */
+  importSessions: async (repo: string, sessions: string[]) =>
+    (await request<{ tasks: Task[] }>({ type: "import", repo, sessions })).tasks,
 };
 
 // ---- events ----

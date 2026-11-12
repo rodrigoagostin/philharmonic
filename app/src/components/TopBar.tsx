@@ -48,6 +48,9 @@ export function TopBar() {
           <Icon name="bell" /> {waiting.length} need{waiting.length === 1 ? "s" : ""} you
         </button>
       )}
+      <button className="btn" onClick={() => s.setImportOpen(true)} title="Bring Claude Code threads you already started onto the Stage">
+        <Icon name="import" /> Open threads
+      </button>
       <button className="btn btn-primary" onClick={() => s.setNewTaskOpen(true)}>
         <Icon name="plus" /> New task <kbd className="kbd kbd-dark">⌘N</kbd>
       </button>
