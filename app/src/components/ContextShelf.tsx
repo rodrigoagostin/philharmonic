@@ -36,6 +36,12 @@ export function ContextShelf({ taskId }: { taskId?: number }) {
   const [message, setMessage] = useState("");
   const fileInput = useRef<HTMLInputElement>(null);
 
+  // Tasks may load after the shelf opens: pick a project once there is one, so the
+  // Project tab never quietly shows (and adds to) the inbox.
+  useEffect(() => {
+    if (!repo && repos.length) setRepo(repos[0]);
+  }, [repo, repos]);
+
   const scope: Scope =
     tab === "task" && task ? { kind: "task", id: task.id } : tab === "project" && repo ? { kind: "project", repo } : { kind: "inbox" };
   const items = s.context.filter((c) => sameScope(c.scope, scope));

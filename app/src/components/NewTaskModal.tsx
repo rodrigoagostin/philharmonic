@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { api, repoName, type ContextItem } from "../api";
 import { recentRepos, rememberRepo, useStore } from "../store";
@@ -22,20 +22,32 @@ export function NewTaskModal() {
   const [picking, setPicking] = useState(false);
   const [busy, setBusy] = useState(false);
   const close = () => s.setNewTaskOpen(false);
+  // Files pasted or dropped here go to the inbox right away. If you cancel, they go too.
+  const uploaded = useRef<number[]>([]);
+  const cancel = () => {
+    uploaded.current.forEach((id) => api.removeContext(id).catch(() => {}));
+    close();
+  };
 
   useEffect(() => {
     if (!repo) return;
+    // Switching repos quickly: ignore answers for a repo that's no longer selected.
+    let current = true;
     api
       .branches(repo)
       .then((names) => {
+        if (!current) return;
         setBranches(names);
         setBase((b) => (names.includes(b) ? b : (names.find((n) => n === "main" || n === "master") ?? names[0] ?? "")));
       })
-      .catch(() => setBranches([]));
+      .catch(() => current && setBranches([]));
+    return () => {
+      current = false;
+    };
   }, [repo]);
 
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && close();
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && cancel();
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   });
@@ -49,7 +61,10 @@ export function NewTaskModal() {
   async function add(list: NewContext[]) {
     for (const c of list) {
       const item = await s.run(() => api.addContext({ scope: { kind: "inbox" }, ...c }));
-      if (item) setAttached((a) => [...a, item.id]);
+      if (item) {
+        uploaded.current.push(item.id);
+        setAttached((a) => [...a, item.id]);
+      }
     }
   }
 
@@ -83,11 +98,11 @@ export function NewTaskModal() {
   }
 
   return (
-    <div className="backdrop" onMouseDown={(e) => e.target === e.currentTarget && close()}>
+    <div className="backdrop" onMouseDown={(e) => e.target === e.currentTarget && cancel()}>
       <div className="modal" role="dialog" aria-modal="true" aria-labelledby="new-task-title">
         <header className="modal-head">
           <h1 id="new-task-title">New task</h1>
-          <button className="icon-btn" aria-label="Close" onClick={close}>
+          <button className="icon-btn" aria-label="Close" onClick={cancel}>
             <Icon name="close" />
           </button>
         </header>
@@ -224,7 +239,7 @@ export function NewTaskModal() {
           <span className="small muted grow">
             The first time, Claude Code asks whether you trust the new folder. Answer it from the task card.
           </span>
-          <button className="btn" onClick={close}>
+          <button className="btn" onClick={cancel}>
             Cancel
           </button>
           <button className="btn btn-primary" onClick={start} disabled={!canStart}>

@@ -56,6 +56,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const toastId = useRef(0);
   const notifyOk = useRef(false);
+  // Last known status per task, to notify on changes. Kept outside React state so the
+  // check happens once per event (state updaters can run twice in StrictMode).
+  const statuses = useRef(new Map<number, TaskStatus>());
 
   const toast = useCallback((text: string, kind: Toast["kind"] = "info") => {
     const id = ++toastId.current;
@@ -78,6 +81,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const reload = useCallback(async () => {
     try {
       const [list, items] = await Promise.all([api.listTasks(), api.listContext()]);
+      statuses.current = new Map(list.map((t) => [t.id, t.status]));
       setTasks(new Map(list.map((t) => [t.id, t])));
       setContext(items);
     } catch {
@@ -100,16 +104,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       },
       onEvent: (e) => {
         if (e.kind === "task_updated") {
+          const before = statuses.current.get(e.task.id);
+          statuses.current.set(e.task.id, e.task.status);
+          if (before && before !== e.task.status && ATTENTION.includes(e.task.status)) notify(e.task);
           setTasks((prev) => {
-            const before = prev.get(e.task.id);
-            if (before && before.status !== e.task.status && ATTENTION.includes(e.task.status)) {
-              notify(e.task);
-            }
             const next = new Map(prev);
             next.set(e.task.id, e.task);
             return next;
           });
         } else if (e.kind === "task_removed") {
+          statuses.current.delete(e.id);
           setTasks((prev) => {
             const next = new Map(prev);
             next.delete(e.id);
@@ -117,6 +121,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           });
         } else if (e.kind === "context_changed") {
           api.listContext().then(setContext).catch(() => {});
+        } else if (e.kind === "resync") {
+          reload(); // we missed events
         }
       },
     }).then((u) => (unlisten = u));

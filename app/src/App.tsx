@@ -56,7 +56,8 @@ export function App() {
         <Sidebar />
         <main className="main">
           {s.view.name === "stage" && <Stage />}
-          {s.view.name === "focus" && s.task(s.view.id) && <Focus task={s.task(s.view.id)!} />}
+          {/* `key`: a fresh Focus per task, so drafts, attachments and panels never carry over. */}
+          {s.view.name === "focus" && s.task(s.view.id) && <Focus key={s.view.id} task={s.task(s.view.id)!} />}
           {s.view.name === "review" && s.task(s.view.id) && <Review task={s.task(s.view.id)!} />}
           {s.view.name === "context" && <ContextShelf taskId={s.view.taskId} />}
         </main>

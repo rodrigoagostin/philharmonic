@@ -16,11 +16,21 @@ interface FileDiff {
   lines: Line[];
   binary: boolean;
 }
+/** Which file version a line number refers to: deleted lines only exist in the old one. */
+type Side = "old" | "new";
+
 interface Comment {
   file: string;
   line: number;
+  side: Side;
   code: string;
   text: string;
+}
+
+/** Where a diff line lives: added and context lines by their new number, deleted ones by
+ * their old number. (Old line 10 and new line 10 are different lines.) */
+function anchor(l: Line): { line: number; side: Side } {
+  return l.newNo !== undefined ? { line: l.newNo, side: "new" } : { line: l.oldNo ?? 0, side: "old" };
 }
 
 /** Split a unified diff into files and numbered lines. */
@@ -66,11 +76,12 @@ export function Review({ task }: { task: Task }) {
   const [loading, setLoading] = useState(true);
   const [active, setActive] = useState<string | null>(null);
   const [comments, setComments] = useState<Comment[]>([]);
-  const [editing, setEditing] = useState<{ file: string; line: number; code: string } | null>(null);
+  const [editing, setEditing] = useState<{ file: string; line: number; side: Side; code: string } | null>(null);
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const [confirmDiscard, setConfirmDiscard] = useState(false);
   const live = LIVE.includes(task.status);
+  const shipped = task.status === "done";
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -98,7 +109,10 @@ export function Review({ task }: { task: Task }) {
 
   async function sendComments() {
     const body = comments
-      .map((c, i) => `${i + 1}. ${c.file}:${c.line} (\`${c.code.trim()}\`)\n   ${c.text.split("\n").join("\n   ")}`)
+      .map(
+        (c, i) =>
+          `${i + 1}. ${c.file}:${c.line}${c.side === "old" ? " (a line you removed; old line number)" : ""} (\`${c.code.trim()}\`)\n   ${c.text.split("\n").join("\n   ")}`,
+      )
       .join("\n\n");
     const ok = await s.run(() => api.send(task.id, `Review comments on your changes. Please address each one:\n\n${body}`));
     if (ok !== undefined) {
@@ -156,10 +170,10 @@ export function Review({ task }: { task: Task }) {
         <button className="btn btn-attention" disabled={!comments.length || !live} onClick={sendComments}>
           Send {comments.length} comment{comments.length === 1 ? "" : "s"} to agent
         </button>
-        <button className="btn" disabled={busy || !files.length} onClick={() => ship("merge")}>
+        <button className="btn" disabled={busy || shipped || !files.length} onClick={() => ship("merge")}>
           Merge locally
         </button>
-        <button className="btn btn-primary" disabled={busy || !files.length} onClick={() => ship("pr")}>
+        <button className="btn btn-primary" disabled={busy || shipped || !files.length} onClick={() => ship("pr")}>
           Create PR
         </button>
       </header>
@@ -183,6 +197,7 @@ export function Review({ task }: { task: Task }) {
                 <div key={i} className="comment-mini">
                   <span className="mono small">
                     {c.file}:{c.line}
+                    {c.side === "old" ? " (removed)" : ""}
                   </span>
                   <p className="small">{c.text}</p>
                   <button className="link-btn small" onClick={() => setComments((cs) => cs.filter((_, j) => j !== i))}>
@@ -202,9 +217,11 @@ export function Review({ task }: { task: Task }) {
               <h3 className="diff-file-head mono">{d.path}</h3>
               {d.binary && <p className="muted small">Binary file</p>}
               {d.lines.map((l, i) => {
-                const lineNo = l.newNo ?? l.oldNo ?? 0;
-                const lineComments = comments.filter((c) => c.file === d.path && c.line === lineNo && l.kind !== "hunk");
-                const isEditing = editing && editing.file === d.path && editing.line === lineNo && l.kind !== "hunk";
+                const at = anchor(l);
+                const here = (c: { file: string; line: number; side: Side }) =>
+                  l.kind !== "hunk" && c.file === d.path && c.line === at.line && c.side === at.side;
+                const lineComments = comments.filter(here);
+                const isEditing = editing && here(editing);
                 return (
                   <div key={i}>
                     <button
@@ -212,7 +229,7 @@ export function Review({ task }: { task: Task }) {
                       disabled={l.kind === "hunk"}
                       title={l.kind === "hunk" ? undefined : "Comment on this line"}
                       onClick={() => {
-                        setEditing({ file: d.path, line: lineNo, code: l.text });
+                        setEditing({ file: d.path, ...at, code: l.text });
                         setDraft("");
                       }}
                     >

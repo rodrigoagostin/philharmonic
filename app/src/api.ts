@@ -43,14 +43,26 @@ export interface FileChange {
 export type DaemonEvent =
   | { kind: "task_updated"; task: Task }
   | { kind: "task_removed"; id: number }
-  | { kind: "output"; id: number; data: string }
-  | { kind: "context_changed" };
+  | { kind: "output"; id: number; data: string; offset: number }
+  | { kind: "context_changed" }
+  | { kind: "resync" };
 
 /** Send a request; returns the response, or throws the daemon's error message. */
 export async function request<T = any>(req: Record<string, unknown>): Promise<T> {
   const res = await invoke<any>("daemon", { request: req });
   if (res?.type === "error") throw new Error(res.message);
   return res as T;
+}
+
+// Keystrokes and resizes must reach the agent in the order they happened. Each request
+// travels on its own connection and the daemon handles connections in parallel, so they
+// are sent one after another: the next leaves when the previous has been answered.
+// One queue per task, so a stuck agent doesn't hold up typing into the others.
+const terminalQueues = new Map<number, Promise<unknown>>();
+function inOrder<T>(id: number, send: () => Promise<T>): Promise<T> {
+  const result = (terminalQueues.get(id) ?? Promise.resolve()).then(send);
+  terminalQueues.set(id, result.catch(() => {}));
+  return result;
 }
 
 export const api = {
@@ -68,10 +80,14 @@ export const api = {
   resume: (id: number) => request({ type: "resume", id }),
   discard: (id: number) => request({ type: "discard", id }),
   markDone: (id: number) => request({ type: "mark_done", id }),
-  input: (id: number, bytes: Uint8Array) => request({ type: "input", id, data: bytesToB64(bytes) }),
-  key: (id: number, key: string) => request({ type: "input", id, data: bytesToB64(new TextEncoder().encode(key)) }),
-  resize: (id: number, cols: number, rows: number) => request({ type: "resize", id, cols, rows }),
-  screen: (id: number) => request<{ history: string; text: string }>({ type: "screen", id }),
+  input: (id: number, bytes: Uint8Array) => inOrder(id, () => request({ type: "input", id, data: bytesToB64(bytes) })),
+  key: (id: number, key: string) =>
+    inOrder(id, () => request({ type: "input", id, data: bytesToB64(new TextEncoder().encode(key)) })),
+  resize: (id: number, cols: number, rows: number) => inOrder(id, () => request({ type: "resize", id, cols, rows })),
+  /** Full output history (to replay) + visible text. `end` = stream offset after the history. */
+  screen: (id: number) => request<{ history: string; text: string; end: number }>({ type: "screen", id }),
+  /** Just the visible text: cheap, for previews. */
+  screenText: async (id: number) => (await request<{ text: string }>({ type: "screen_text", id })).text,
   send: (id: number, text: string, context: number[] = []) => request({ type: "send", id, text, context }),
   diff: (id: number) => request<{ files: FileChange[]; patch: string }>({ type: "diff", id }),
   ship: async (id: number, how: "pr" | "merge") =>
@@ -86,8 +102,20 @@ export const api = {
 
 // ---- events ----
 
-type OutputListener = (bytes: Uint8Array) => void;
+/** `offset` is where `bytes` start in the task's output stream (see `api.screen().end`). */
+type OutputListener = (bytes: Uint8Array, offset: number) => void;
 const outputListeners = new Map<number, Set<OutputListener>>();
+const resyncListeners = new Set<() => void>();
+
+/** Called when the app may have missed events (the daemon said so, or it reconnected). */
+export function onResync(fn: () => void): () => void {
+  resyncListeners.add(fn);
+  return () => resyncListeners.delete(fn);
+}
+
+function resync() {
+  resyncListeners.forEach((fn) => fn());
+}
 
 /** Terminal output arrives very often; components subscribe per task instead of via React state. */
 export function onOutput(id: number, fn: OutputListener): () => void {
@@ -103,13 +131,19 @@ export async function listenToDaemon(handlers: {
   const un1 = await listen<DaemonEvent>("ph-event", ({ payload }) => {
     if (payload.kind === "output") {
       const bytes = b64ToBytes(payload.data);
-      outputListeners.get(payload.id)?.forEach((fn) => fn(bytes));
+      outputListeners.get(payload.id)?.forEach((fn) => fn(bytes, payload.offset));
+    } else if (payload.kind === "resync") {
+      resync();
     }
     handlers.onEvent(payload);
   });
-  const un2 = await listen<{ connected: boolean; error?: string }>("ph-connection", ({ payload }) =>
-    handlers.onConnection(payload.connected, payload.error),
-  );
+  let wasConnected = false;
+  const un2 = await listen<{ connected: boolean; error?: string }>("ph-connection", ({ payload }) => {
+    handlers.onConnection(payload.connected, payload.error);
+    // Back after a disconnect (maybe a daemon restart): everything may have changed.
+    if (payload.connected && !wasConnected) resync();
+    wasConnected = payload.connected;
+  });
   return () => {
     un1();
     un2();

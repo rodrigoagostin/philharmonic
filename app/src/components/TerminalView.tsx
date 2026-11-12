@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import { api, b64ToBytes, onOutput } from "../api";
+import { api, b64ToBytes, onOutput, onResync } from "../api";
 
 /** The agent's real terminal: what you type goes straight to its PTY. */
 export function TerminalView({ id, live }: { id: number; live: boolean }) {
@@ -22,24 +22,48 @@ export function TerminalView({ id, live }: { id: number; live: boolean }) {
     term.loadAddon(fit);
     term.open(el);
 
-    // Subscribe first, buffer until the history is written, so nothing is lost or doubled.
-    let ready = false;
-    const pending: Uint8Array[] = [];
-    const off = onOutput(id, (bytes) => (ready ? term.write(bytes) : pending.push(bytes)));
+    // Every output chunk carries its position in the task's output stream, and the history
+    // says where it ends. `pos` is how far this terminal has written, so each byte is
+    // written exactly once: chunks we already have are skipped, and a gap (missed events)
+    // triggers a fresh replay.
     let alive = true;
-    api
-      .screen(id)
-      .then((r) => {
-        if (!alive) return;
-        term.write(b64ToBytes(r.history));
-      })
-      .catch(() => {})
-      .finally(() => {
-        if (!alive) return;
-        pending.forEach((b) => term.write(b));
-        pending.length = 0;
-        ready = true;
-      });
+    let ready = false;
+    let pos = 0;
+    let pending: { bytes: Uint8Array; offset: number }[] = [];
+
+    const writeChunk = (bytes: Uint8Array, offset: number) => {
+      const end = offset + bytes.length;
+      if (end <= pos) return; // already written
+      if (offset > pos) return replay(); // missed something
+      term.write(offset < pos ? bytes.subarray(pos - offset) : bytes);
+      pos = end;
+    };
+
+    function replay() {
+      ready = false;
+      pending = [];
+      api
+        .screen(id)
+        .then((r) => {
+          if (!alive) return;
+          term.reset();
+          term.write(b64ToBytes(r.history));
+          pos = r.end;
+        })
+        .catch(() => {})
+        .finally(() => {
+          if (!alive) return;
+          ready = true;
+          const queued = pending;
+          pending = [];
+          queued.forEach((c) => writeChunk(c.bytes, c.offset));
+        });
+    }
+
+    // Subscribe first, then load the history, buffering what arrives in between.
+    const off = onOutput(id, (bytes, offset) => (ready ? writeChunk(bytes, offset) : pending.push({ bytes, offset })));
+    const offResync = onResync(replay);
+    replay();
 
     const enc = new TextEncoder();
     const d1 = term.onData((data) => api.input(id, enc.encode(data)).catch(() => {}));
@@ -68,6 +92,7 @@ export function TerminalView({ id, live }: { id: number; live: boolean }) {
     return () => {
       alive = false;
       off();
+      offResync();
       ro.disconnect();
       d1.dispose();
       d2.dispose();
