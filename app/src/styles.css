@@ -1203,7 +1203,20 @@ textarea {
   cursor: pointer;
 }
 
-/* ---- import existing threads ---- */
+/* ---- open a folder / import existing threads ---- */
+.open-here {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+.open-here textarea {
+  flex: 1;
+  resize: vertical;
+}
+.thread-head {
+  margin: 4px 0 0;
+  font-weight: 600;
+}
 .thread-list {
   display: flex;
   flex-direction: column;

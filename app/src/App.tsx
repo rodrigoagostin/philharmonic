@@ -22,6 +22,9 @@ export function App() {
       if (e.metaKey && e.key.toLowerCase() === "n") {
         e.preventDefault();
         s.setNewTaskOpen(true);
+      } else if (e.metaKey && e.key.toLowerCase() === "o") {
+        e.preventDefault();
+        s.setImportOpen(true);
       } else if (e.metaKey && e.key.toLowerCase() === "k") {
         e.preventDefault();
         s.go({ name: "stage" });

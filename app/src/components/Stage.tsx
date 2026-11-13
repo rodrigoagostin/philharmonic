@@ -35,16 +35,20 @@ export function Stage() {
       </header>
       {tasks.length === 0 ? (
         <div className="empty">
-          <p>{q ? "No tasks match your search." : "Nothing on stage. Start a task and the agent gets its own worktree."}</p>
+          <p>
+            {q
+              ? "No tasks match your search."
+              : "Nothing on stage. Open a folder to work in it as it is, or start a task in its own worktree."}
+          </p>
           <div className="row" style={{ justifyContent: "center" }}>
-            <button className="btn btn-primary" onClick={() => s.setNewTaskOpen(true)}>
-              <Icon name="plus" /> New task
-            </button>
             {!q && (
-              <button className="btn" onClick={() => s.setImportOpen(true)}>
-                <Icon name="import" /> Open existing threads
+              <button className="btn btn-primary" onClick={() => s.setImportOpen(true)}>
+                <Icon name="import" /> Open folder
               </button>
             )}
+            <button className="btn" onClick={() => s.setNewTaskOpen(true)}>
+              <Icon name="plus" /> New task
+            </button>
           </div>
         </div>
       ) : (
@@ -86,7 +90,7 @@ function TaskCard({ task }: { task: Task }) {
       <p className="muted small ellipsis mono">
         {task.agent.kind === "claude" ? "claude" : "custom"} · {repoName(task.repo)}
         {task.collections.length > 0 && ` (${task.collections.map((id) => s.collection(id)?.name).filter(Boolean).join(", ")})`} ·{" "}
-        {task.branch}
+        {task.branch || "no git"}
       </p>
       <NowLine task={task} />
       <pre className="tail" onClick={open}>

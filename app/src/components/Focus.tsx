@@ -53,7 +53,7 @@ export function Focus({ task }: { task: Task }) {
           <header className="term-head">
             <span className="task-num">#{task.id}</span>
             <strong className="ellipsis grow">{task.title}</strong>
-            <span className="muted small mono ellipsis term-project" title={`${task.repo} · ${task.branch}`}>
+            <span className="muted small mono ellipsis term-project" title={task.branch ? `${task.repo} · ${task.branch}` : task.repo}>
               {repoName(task.repo)}
             </span>
             <StatusPill status={task.status} />
@@ -131,7 +131,7 @@ export function Focus({ task }: { task: Task }) {
               <dd className="mono selectable">{task.repo}</dd>
               <dt>Branch</dt>
               <dd className="mono selectable">
-                {task.branch} ← {task.base}
+                {task.base ? `${task.branch} ← ${task.base}` : "no git"}
               </dd>
               <dt>{task.adopted ? "Folder" : "Worktree"}</dt>
               <dd className="mono selectable">{task.worktree}</dd>

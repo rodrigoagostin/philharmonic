@@ -88,6 +88,7 @@ The app reuses a daemon that's already running. After changing daemon code, stop
 CLI:
 
 ```sh
+ph open ~/code/site          # Claude right in that folder (git or not): no worktree, no branch
 ph new "Add rate limiting to /auth" --repo ~/code/api --base main
 ph ls
 ph show 1                # what's on the agent's screen

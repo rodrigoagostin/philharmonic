@@ -170,8 +170,13 @@ async fn dispatch(request: Request, d: &Shared) -> Result<Response> {
         // ---- review & ship ----
         Request::Diff { id, patch } => {
             let task = existing(d, id)?;
-            let (files, patch) = git::diff(&task.worktree, &task.base, patch).await?;
-            Response::Diff { files, patch }
+            // An agent opened in a folder without git: there's nothing to compare against.
+            if task.base.is_empty() {
+                Response::Diff { files: Vec::new(), patch: String::new() }
+            } else {
+                let (files, patch) = git::diff(&task.worktree, &task.base, patch).await?;
+                Response::Diff { files, patch }
+            }
         }
         Request::Ship { id, how } => {
             let task = existing(d, id)?;
@@ -199,6 +204,7 @@ async fn dispatch(request: Request, d: &Shared) -> Result<Response> {
         // ---- existing threads ----
         Request::Discover { repo } => Response::Discovered { sessions: discover(d, &repo).await? },
         Request::Import { repo, sessions } => Response::Tasks { tasks: import(d, &repo, &sessions).await? },
+        Request::OpenAgent { folder, prompt } => Response::Task { task: open_agent(d, &folder, prompt).await? },
 
         // ---- collections ----
         Request::ListCollections => Response::Collections { collections: context_store::collections(d) },
@@ -399,6 +405,9 @@ fn title_from(prompt: &str) -> String {
 }
 
 async fn ship(task: &Task, how: ShipMethod) -> Result<String> {
+    if task.base.is_empty() {
+        bail!("this folder isn't a git repository, so there's nothing to merge or open a PR from");
+    }
     // Imported threads can work right on `main`, or on a detached HEAD.
     if task.branch == task.base || task.branch == "HEAD" {
         bail!(
@@ -423,8 +432,12 @@ async fn ship(task: &Task, how: ShipMethod) -> Result<String> {
 /// The Claude Code conversations already started in a repo: in its main checkout, its
 /// worktrees, or their subfolders. Newest first.
 async fn discover(d: &Shared, repo: &std::path::Path) -> Result<Vec<FoundSession>> {
-    let checkouts = git::worktrees(repo).await.with_context(|| format!("{} isn't a git repository", repo.display()))?;
-    let roots = checkouts.clone();
+    // A git repo: its main checkout and every worktree. Any other folder: just itself.
+    let git_checkouts = git::worktrees(repo).await.ok();
+    let roots = match &git_checkouts {
+        Some(c) => c.clone(),
+        None => vec![std::fs::canonicalize(repo).with_context(|| format!("folder not found: {}", repo.display()))?],
+    };
     let found = tokio::task::spawn_blocking(move || {
         let mut all: Vec<sessions::Session> = Vec::new();
         for root in &roots {
@@ -443,11 +456,13 @@ async fn discover(d: &Shared, repo: &std::path::Path) -> Result<Vec<FoundSession
     let mut out = Vec::new();
     for s in found {
         // A subfolder may be a different repo (one nested inside this one): skip those.
-        match git::toplevel(&s.cwd).await {
-            Ok(top) if checkouts.contains(&top) => {}
-            _ => continue,
+        if let Some(checkouts) = &git_checkouts {
+            match git::toplevel(&s.cwd).await {
+                Ok(top) if checkouts.contains(&top) => {}
+                _ => continue,
+            }
         }
-        let branch = git::current_branch(&s.cwd).await.unwrap_or_else(|_| "HEAD".to_string());
+        let branch = git::current_branch(&s.cwd).await.unwrap_or_default();
         let task = tasks
             .iter()
             .find(|t| t.session.as_deref() == Some(s.id.as_str()) || (!t.adopted && t.session.is_none() && t.worktree == s.cwd))
@@ -468,12 +483,82 @@ async fn discover(d: &Shared, repo: &std::path::Path) -> Result<Vec<FoundSession
     Ok(out)
 }
 
+/// Where a task in `folder` belongs: (the repo's main checkout, its default branch), so
+/// merges go there whichever folder was picked. A folder without git: (itself, "").
+async fn home_of(folder: &std::path::Path) -> Result<(PathBuf, String)> {
+    match git::worktrees(folder).await {
+        Ok(checkouts) => {
+            let main = checkouts.into_iter().next().context("no main checkout")?;
+            let base = git::default_branch(&main).await?;
+            Ok((main, base))
+        }
+        Err(_) => Ok((std::fs::canonicalize(folder)?, String::new())),
+    }
+}
+
+/// Start Claude Code right in your folder, as it is: no worktree, no branch of ours.
+async fn open_agent(d: &Shared, folder: &std::path::Path, prompt: Option<String>) -> Result<Task> {
+    let folder = std::fs::canonicalize(folder).with_context(|| format!("folder not found: {}", folder.display()))?;
+    if !folder.is_dir() {
+        bail!("{} isn't a folder", folder.display());
+    }
+    let (repo, base) = home_of(&folder).await?;
+    let branch = if base.is_empty() { String::new() } else { git::current_branch(&folder).await.unwrap_or_default() };
+    let prompt = prompt.map(|p| p.trim().to_string()).filter(|p| !p.is_empty());
+    let name = folder.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| folder.display().to_string());
+    let collections = context_store::linked_to(d, &repo);
+    let task = {
+        let mut state = d.state.lock().unwrap();
+        let task = Task {
+            id: state.next_id(),
+            title: prompt.as_deref().map(title_from).unwrap_or_else(|| format!("Agent in {name}")),
+            prompt: prompt.clone().unwrap_or_default(),
+            repo,
+            base,
+            branch,
+            worktree: folder,
+            agent: Agent::Claude,
+            model: None,
+            auto_approve: false,
+            status: TaskStatus::Queued,
+            created_at: now(),
+            started: false,
+            session: None,
+            adopted: true,
+            collections,
+            doing: None,
+            plan: Vec::new(),
+            subagents: Vec::new(),
+            usage: Usage::default(),
+            tool_calls: 0,
+            summary: None,
+            last_activity: now(),
+        };
+        state.insert(task.clone());
+        task
+    };
+    d.save();
+    d.emit(Event::TaskUpdated { task: task.clone() });
+    record(d, task.id, None, ActivityKind::Lifecycle, format!("Opened in {}", task.worktree.display()));
+    // No prompt: Claude Code opens at its prompt, waiting for you.
+    let start = Start::Fresh { prompt: task.prompt.clone() };
+    let running = start_agent(d, &task, start, TaskStatus::Failed)?;
+    if prompt.is_none() {
+        return d
+            .update_task(task.id, |t| {
+                if t.status == TaskStatus::Running {
+                    t.status = TaskStatus::NeedsInput;
+                }
+            })
+            .context("no such task");
+    }
+    Ok(running)
+}
+
 /// Turn found conversations into stopped tasks. Ones that are already tasks are skipped.
 async fn import(d: &Shared, repo: &std::path::Path, ids: &[String]) -> Result<Vec<Task>> {
     let found = discover(d, repo).await?;
-    // Tasks belong to the main checkout (merges go there), whichever folder was picked.
-    let main = git::worktrees(repo).await?.into_iter().next().context("no main checkout")?;
-    let base = git::default_branch(&main).await?;
+    let (main, base) = home_of(repo).await?;
     // Like a new task there: it uses the collections linked to the repo.
     let collections = context_store::linked_to(d, &main);
 

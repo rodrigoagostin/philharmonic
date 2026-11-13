@@ -86,6 +86,14 @@ enum Command {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
     },
+    /// Start Claude Code right in a folder (git or not): no worktree, no branch.
+    Open {
+        #[arg(default_value = ".")]
+        folder: PathBuf,
+        /// Something to start with (optional: without it, Claude waits for you).
+        #[arg(long)]
+        prompt: Option<String>,
+    },
     /// What a task's agent did (or every agent's latest actions, without an id).
     Log {
         id: Option<TaskId>,
@@ -147,6 +155,7 @@ async fn main() -> Result<()> {
         },
         Command::Rm { id } => Request::Discard { id },
         Command::Threads { repo } => Request::Discover { repo: absolute(&repo)? },
+        Command::Open { folder, prompt } => Request::OpenAgent { folder: absolute(&folder)?, prompt },
         Command::Import { ids, repo } => {
             let repo = absolute(&repo)?;
             let sessions = if ids.is_empty() {

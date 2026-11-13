@@ -128,6 +128,13 @@ pub enum Request {
     Discover { repo: PathBuf },
     /// Turn found conversations into (stopped) tasks you can resume. Ids from `Discover`.
     Import { repo: PathBuf, sessions: Vec<String> },
+    /// Start Claude Code right in a folder (git or not): no worktree, no branch, and the
+    /// prompt is optional. Discarding it later only forgets it.
+    OpenAgent {
+        folder: PathBuf,
+        #[serde(default)]
+        prompt: Option<String>,
+    },
 
     // ---- collections ----
     ListCollections,

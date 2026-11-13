@@ -76,8 +76,12 @@ export function TopBar() {
           <Icon name="bell" /> {waiting.length} need{waiting.length === 1 ? "s" : ""} you
         </button>
       )}
-      <button className="btn" onClick={() => s.setImportOpen(true)} title="Bring Claude Code threads you already started onto the Stage">
-        <Icon name="import" /> Open threads
+      <button
+        className="btn"
+        onClick={() => s.setImportOpen(true)}
+        title="Work in a folder as it is: start an agent there, or bring in the Claude Code threads you already have"
+      >
+        <Icon name="import" /> Open folder <kbd className="kbd">⌘O</kbd>
       </button>
       <button className="btn btn-primary" onClick={() => s.setNewTaskOpen(true)}>
         <Icon name="plus" /> New task <kbd className="kbd kbd-dark">⌘N</kbd>

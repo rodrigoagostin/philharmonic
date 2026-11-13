@@ -243,6 +243,8 @@ fn command_for(d: &Shared, task: &Task, start: Start) -> Result<CommandBuilder> 
             }
             match start {
                 // `--` so a prompt starting with `-` isn't read as a flag.
+                // No prompt (an agent opened in a folder): Claude Code waits at its prompt.
+                Start::Fresh { prompt } if prompt.trim().is_empty() => {}
                 Start::Fresh { prompt } => cmd.args(["--", &prompt]),
                 // The exact conversation if we know it, else the folder's latest.
                 Start::Resume => match &task.session {

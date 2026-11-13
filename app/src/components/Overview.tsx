@@ -51,10 +51,15 @@ export function Overview() {
         <div className="ov-agents">
           {shown.length === 0 ? (
             <div className="empty">
-              <p>No tasks yet. Start one and watch its agents here.</p>
-              <button className="btn btn-primary" onClick={() => s.setNewTaskOpen(true)}>
-                <Icon name="plus" /> New task
-              </button>
+              <p>No agents yet. Open a folder to work in it as it is, or start a task in its own worktree.</p>
+              <div className="row" style={{ justifyContent: "center" }}>
+                <button className="btn btn-primary" onClick={() => s.setImportOpen(true)}>
+                  <Icon name="import" /> Open folder
+                </button>
+                <button className="btn" onClick={() => s.setNewTaskOpen(true)}>
+                  <Icon name="plus" /> New task
+                </button>
+              </div>
             </div>
           ) : (
             shown.map((t) => (
@@ -120,7 +125,7 @@ const AgentBlock = memo(function AgentBlock({ task, picked, onPick }: { task: Ta
         {repoName(task.repo)}
         {task.collections.length > 0 &&
           ` (${task.collections.map((id) => s.collection(id)?.name).filter(Boolean).join(", ")})`}{" "}
-        · {task.branch} · {task.model ?? (task.agent.kind === "claude" ? "claude" : "custom")} · <Elapsed since={task.created_at} until={LIVE.includes(task.status) ? null : task.last_activity} /> ·{" "}
+        · {task.branch || "no git"} · {task.model ?? (task.agent.kind === "claude" ? "claude" : "custom")} · <Elapsed since={task.created_at} until={LIVE.includes(task.status) ? null : task.last_activity} /> ·{" "}
         {task.tool_calls} actions · {compact(usageTotal(task.usage))} tokens
         {task.subagents.length > 0 && ` · ${task.subagents.length} subagent${task.subagents.length === 1 ? "" : "s"}${subRunning ? ` (${subRunning} running)` : ""}`}
       </p>

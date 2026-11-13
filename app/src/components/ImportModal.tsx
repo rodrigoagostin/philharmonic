@@ -4,7 +4,10 @@ import { ago, api, repoName, type FoundSession } from "../api";
 import { recentRepos, rememberRepo, useStore } from "../store";
 import { Icon } from "./ui";
 
-/** Pick a repo and bring the Claude Code threads already started there onto the Stage. */
+/**
+ * Work in a folder as it is (git or not): start an agent right there, and/or bring the
+ * Claude Code threads already started in it onto the Stage. No worktree, no branch.
+ */
 export function ImportModal({ initialRepo }: { initialRepo?: string }) {
   const s = useStore();
   const repos = [...new Set([...recentRepos(), ...s.tasks.map((t) => t.repo)])];
@@ -13,6 +16,7 @@ export function ImportModal({ initialRepo }: { initialRepo?: string }) {
   const [error, setError] = useState<string>();
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
+  const [prompt, setPrompt] = useState("");
   const close = () => s.setImportOpen(false);
 
   useEffect(() => {
@@ -41,7 +45,7 @@ export function ImportModal({ initialRepo }: { initialRepo?: string }) {
   });
 
   async function browse() {
-    const dir = await s.run(() => open({ directory: true, title: "Choose a project folder" }));
+    const dir = await s.run(() => open({ directory: true, title: "Choose a folder to work in" }));
     if (typeof dir === "string") setRepo(dir);
   }
 
@@ -68,6 +72,17 @@ export function ImportModal({ initialRepo }: { initialRepo?: string }) {
     }
   }
 
+  async function startHere() {
+    setBusy(true);
+    const task = await s.run(() => api.openAgent(repo, prompt.trim()));
+    setBusy(false);
+    if (task) {
+      rememberRepo(task.repo);
+      close();
+      s.go({ name: "focus", id: task.id });
+    }
+  }
+
   // Where a thread runs, relative to the repo: the main checkout, a worktree, a subfolder.
   const where = (f: FoundSession) => {
     if (f.cwd === repo) return "main checkout";
@@ -79,23 +94,22 @@ export function ImportModal({ initialRepo }: { initialRepo?: string }) {
     <div className="backdrop" onMouseDown={(e) => e.target === e.currentTarget && close()}>
       <div className="modal" role="dialog" aria-modal="true" aria-labelledby="import-title">
         <header className="modal-head">
-          <h1 id="import-title">Open existing threads</h1>
+          <h1 id="import-title">Open a folder</h1>
           <button className="icon-btn" aria-label="Close" onClick={close}>
             <Icon name="close" />
           </button>
         </header>
 
         <p className="small muted">
-          Claude Code conversations you already started in this project (in its folder, its worktrees or their
-          subfolders). Imported threads stay where they are: same folder, same branch. Resuming one continues that exact
-          conversation.
+          Work in the folder as it is, git or not: the agent runs right there, no worktree and no branch. Removing it
+          later never deletes anything.
         </p>
 
         <label className="field">
-          <span>Project</span>
+          <span>Folder</span>
           <div className="row">
             <select className="grow" value={repo} onChange={(e) => setRepo(e.target.value)}>
-              {!repo && <option value="">Choose a project folder</option>}
+              {!repo && <option value="">Choose a folder</option>}
               {repo && !repos.includes(repo) && <option value={repo}>{repoName(repo)}</option>}
               {repos.map((r) => (
                 <option key={r} value={r} title={r}>
@@ -109,10 +123,28 @@ export function ImportModal({ initialRepo }: { initialRepo?: string }) {
           </div>
         </label>
 
+        {repo && (
+          <div className="open-here">
+            <textarea
+              rows={2}
+              value={prompt}
+              placeholder="What should it do? (optional: leave it empty and talk to it once it's open)"
+              onChange={(e) => setPrompt(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) startHere();
+              }}
+            />
+            <button className="btn btn-primary" onClick={startHere} disabled={busy}>
+              <Icon name="plus" /> Start an agent here
+            </button>
+          </div>
+        )}
+
+        {repo && <h2 className="small muted thread-head">Threads already started here</h2>}
         {error && <p className="small bad">{error}</p>}
         {repo && !error && found === null && <p className="small muted">Looking for threads…</p>}
         {found && found.length === 0 && (
-          <p className="small muted empty">No Claude Code threads found for this project yet.</p>
+          <p className="small muted empty">No Claude Code threads in this folder yet.</p>
         )}
 
         {found && found.length > 0 && (
@@ -153,7 +185,7 @@ export function ImportModal({ initialRepo }: { initialRepo?: string }) {
                       )}
                     </div>
                     <p className="muted small ellipsis mono">
-                      {f.branch} · {where(f)} · {f.prompts} prompt{f.prompts === 1 ? "" : "s"} · {ago(f.updated_at)}
+                      {f.branch || "no git"} · {where(f)} · {f.prompts} prompt{f.prompts === 1 ? "" : "s"} · {ago(f.updated_at)}
                     </p>
                   </div>
                 </label>
@@ -171,7 +203,7 @@ export function ImportModal({ initialRepo }: { initialRepo?: string }) {
           <button className="btn" onClick={close}>
             Cancel
           </button>
-          <button className="btn btn-primary" onClick={doImport} disabled={busy || !picked.size}>
+          <button className="btn" onClick={doImport} disabled={busy || !picked.size}>
             {busy ? "Importing…" : `Import ${picked.size || ""} thread${picked.size === 1 ? "" : "s"}`}
           </button>
         </footer>

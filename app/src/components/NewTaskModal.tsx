@@ -358,7 +358,7 @@ export function NewTaskModal() {
               s.setImportOpen(true);
             }}
           >
-            Open existing threads instead
+            Just open the folder instead
           </button>
           <button className="btn" onClick={cancel}>
             Cancel

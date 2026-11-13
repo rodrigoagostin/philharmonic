@@ -212,6 +212,9 @@ export const api = {
   /** Turn found conversations into (stopped) tasks. */
   importSessions: async (repo: string, sessions: string[]) =>
     (await request<{ tasks: Task[] }>({ type: "import", repo, sessions })).tasks,
+  /** Start Claude Code right in a folder (git or not): no worktree, no branch, prompt optional. */
+  openAgent: async (folder: string, prompt?: string) =>
+    normalizeTask((await request<{ task: Task }>({ type: "open_agent", folder, prompt: prompt || null })).task),
 };
 
 // ---- events ----
