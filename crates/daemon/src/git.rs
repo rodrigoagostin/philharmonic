@@ -107,6 +107,37 @@ pub async fn worktrees(repo: &Path) -> Result<Vec<PathBuf>> {
         .collect())
 }
 
+/// Is `dir` inside a git checkout?
+pub async fn is_repo(dir: &Path) -> bool {
+    git(dir, &["rev-parse", "--git-dir"]).await.is_ok()
+}
+
+/// Does the repo have at least one commit? (A fresh `git init` doesn't, and a worktree
+/// needs one to branch from.)
+pub async fn has_commits(dir: &Path) -> bool {
+    git(dir, &["rev-parse", "--verify", "--quiet", "HEAD"]).await.is_ok()
+}
+
+/// Make `dir` usable for tasks: `git init` it (on `main`) if it isn't a repo, and make a
+/// first commit if it has none. When we created the repo, that commit holds the files
+/// already in the folder, so the agent's worktree has them too. Your files don't change.
+pub async fn init(dir: &Path) -> Result<()> {
+    if !is_repo(dir).await {
+        git(dir, &["init", "-b", "main"]).await?;
+        git(dir, &["add", "-A"]).await?;
+    }
+    if !has_commits(dir).await {
+        let commit = ["commit", "--allow-empty", "-m", "Initial commit"];
+        if git(dir, &commit).await.is_err() {
+            // Usually: git doesn't know your name/email yet. Don't make that your problem.
+            let mut args = vec!["-c", "user.name=Philharmonic", "-c", "user.email=philharmonic@localhost"];
+            args.extend(commit);
+            git(dir, &args).await?;
+        }
+    }
+    Ok(())
+}
+
 /// The top folder of the checkout `dir` is in (canonical).
 pub async fn toplevel(dir: &Path) -> Result<PathBuf> {
     let top = git(dir, &["rev-parse", "--show-toplevel"]).await?;
@@ -291,7 +322,7 @@ pub async fn remove(repo: &Path, worktree: &Path, branch: &str, owned_dir: &Path
 
 #[cfg(test)]
 mod tests {
-    use super::{create, diff, merge_into_base, remove};
+    use super::{branches, create, diff, has_commits, init, is_repo, merge_into_base, remove};
     use std::path::Path;
     use std::process::Command;
 
@@ -414,6 +445,30 @@ mod tests {
             "-m",
             "init",
         ]);
+    }
+
+    #[tokio::test]
+    async fn init_makes_a_folder_usable() {
+        // A plain folder with a file in it: the agent's worktree needs that file.
+        let tmp = tempfile::tempdir().unwrap();
+        let plain = tmp.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        std::fs::write(plain.join("idea.txt"), "notes").unwrap();
+        init(&plain).await.unwrap();
+        assert_eq!(run(&plain, &["ls-files"]).trim(), "idea.txt");
+
+        let dir = &tmp.path().join("unborn");
+        std::fs::create_dir(dir).unwrap();
+        assert!(!is_repo(dir).await);
+        run(dir, &["init", "-q", "-b", "main"]); // unborn: a repo, but nothing to branch from
+        run(dir, &["config", "user.email", "t@t"]);
+        run(dir, &["config", "user.name", "t"]);
+        assert!(is_repo(dir).await && !has_commits(dir).await);
+        init(dir).await.unwrap();
+        assert!(has_commits(dir).await);
+        assert_eq!(branches(dir).await.unwrap(), ["main"]);
+        init(dir).await.unwrap(); // a second time changes nothing
+        assert_eq!(run(dir, &["rev-list", "--count", "HEAD"]).trim(), "1");
     }
 
     #[tokio::test]

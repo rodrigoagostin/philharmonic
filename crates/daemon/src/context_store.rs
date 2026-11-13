@@ -32,23 +32,6 @@ fn safe_file_name(name: &str, fallback_ext: &str) -> String {
     format!("{}.{}", slugify(stem, 60), ext)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::safe_file_name;
-
-    #[test]
-    fn keeps_plain_extensions() {
-        assert_eq!(safe_file_name("Screenshot 2026-11-12.PNG", "png"), "screenshot-2026-11-12.png");
-    }
-
-    #[test]
-    fn odd_extensions_fall_back() {
-        assert_eq!(safe_file_name("x.a/b", "bin"), "x-a-b.bin");
-        assert_eq!(safe_file_name("notes.", "bin"), "notes.bin");
-        assert_eq!(safe_file_name("no extension", "bin"), "no-extension.bin");
-    }
-}
-
 pub fn add(
     d: &Shared,
     scope: Scope,
@@ -151,4 +134,21 @@ pub fn describe(items: &[ContextItem]) -> String {
         out.push_str(&line);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_file_name;
+
+    #[test]
+    fn keeps_plain_extensions() {
+        assert_eq!(safe_file_name("Screenshot 2026-11-12.PNG", "png"), "screenshot-2026-11-12.png");
+    }
+
+    #[test]
+    fn odd_extensions_fall_back() {
+        assert_eq!(safe_file_name("x.a/b", "bin"), "x-a-b.bin");
+        assert_eq!(safe_file_name("notes.", "bin"), "notes.bin");
+        assert_eq!(safe_file_name("no extension", "bin"), "no-extension.bin");
+    }
 }

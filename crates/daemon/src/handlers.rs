@@ -182,6 +182,16 @@ async fn new_task(
     // One spelling per repo (`/tmp/x` and `/private/tmp/x` are the same repo), whichever
     // client sent it, so filters and project context line up.
     let repo = std::fs::canonicalize(&repo).with_context(|| format!("repo not found: {}", repo.display()))?;
+    // Tasks run in git worktrees, but any folder will do: one that isn't a repo yet (a
+    // brand-new project) quietly becomes one, with an empty first commit to branch from.
+    let base = if git::is_repo(&repo).await && git::has_commits(&repo).await {
+        base
+    } else {
+        git::init(&repo).await.context("setting up git in the project folder")?;
+        // The app can't list branches before that, so it may not have sent a real one.
+        let names = git::branches(&repo).await?;
+        if names.contains(&base) { base } else { git::current_branch(&repo).await? }
+    };
 
     // Names. If the branch or folder is taken (same prompt twice), try `-2`, `-3`, …
     let base_slug = slugify(&prompt, 40);

@@ -14,6 +14,8 @@ export function NewTaskModal() {
   const [repo, setRepo] = useState(repos[0] ?? "");
   const [branches, setBranches] = useState<string[]>([]);
   const [base, setBase] = useState("");
+  // A new project (not a git repo yet, or no commits): the daemon sets git up on Start.
+  const [fresh, setFresh] = useState(false);
   const [agent, setAgent] = useState<"claude" | "custom">("claude");
   const [model, setModel] = useState("");
   const [command, setCommand] = useState("");
@@ -38,9 +40,16 @@ export function NewTaskModal() {
       .then((names) => {
         if (!current) return;
         setBranches(names);
-        setBase((b) => (names.includes(b) ? b : (names.find((n) => n === "main" || n === "master") ?? names[0] ?? "")));
+        setFresh(names.length === 0);
+        setBase((b) => (names.includes(b) ? b : (names.find((n) => n === "main" || n === "master") ?? names[0] ?? "main")));
       })
-      .catch(() => current && setBranches([]));
+      .catch(() => {
+        if (!current) return;
+        // Not a git repo: fine, it gets one. Don't keep the previous repo's branch list.
+        setBranches([]);
+        setFresh(true);
+        setBase("main");
+      });
     return () => {
       current = false;
     };
@@ -69,7 +78,7 @@ export function NewTaskModal() {
   }
 
   async function browse() {
-    const dir = await s.run(() => open({ directory: true, title: "Choose a git repository" }));
+    const dir = await s.run(() => open({ directory: true, title: "Choose a project folder" }));
     if (typeof dir === "string") setRepo(dir);
   }
 
@@ -187,8 +196,8 @@ export function NewTaskModal() {
           </label>
           <label className="field">
             <span>Base branch</span>
-            <select value={base} onChange={(e) => setBase(e.target.value)} disabled={!branches.length}>
-              {branches.length === 0 && <option value="">—</option>}
+            <select value={base} onChange={(e) => setBase(e.target.value)} disabled={fresh}>
+              {fresh && <option value={base}>{base} (new project)</option>}
               {branches.map((b) => (
                 <option key={b} value={b}>
                   {b}
@@ -224,8 +233,14 @@ export function NewTaskModal() {
         <fieldset className="iso">
           <legend>Isolation</legend>
           <p className="small muted">
-            The agent works in its own git worktree on a new branch <code>ph/…</code> off <code>{base || "the base branch"}</code>. Your
-            checkout is never touched.
+            {fresh ? (
+              "New project, nothing to set up: the agent gets its own copy of the folder to work in, and you review what it made before it lands here."
+            ) : (
+              <>
+                The agent works in its own git worktree on a new branch <code>ph/…</code> off{" "}
+                <code>{base || "the base branch"}</code>. Your checkout is never touched.
+              </>
+            )}
           </p>
           {agent === "claude" && (
             <label className="check small">
