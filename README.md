@@ -4,8 +4,6 @@ Run and steer many coding agents in parallel. Each task gets its own git worktre
 branch and agent session; one place shows which agents are working, which need you,
 and what they changed.
 
-Wireframes: https://claude.ai/artifact/APwbtR6pLJna9iiiCez9Lu
-
 ## Layout
 
 ```
