@@ -1,9 +1,12 @@
-import { useState } from "react";
-import { api, type Task, type TaskStatus } from "../api";
+import { useRef, useState } from "react";
+import { api, repoName, type Task, type TaskStatus } from "../api";
 import { useChangedFiles } from "../hooks";
 import { useStore } from "../store";
+import { ActivityPanel } from "./Activity";
+import { PromptsPanel } from "./Prompts";
 import { Composer } from "./Composer";
-import { TerminalView } from "./TerminalView";
+import { TaskContextPanel } from "./ContextShelf";
+import { TerminalView, type TermControl } from "./TerminalView";
 import { Dot, Icon, StatusPill } from "./ui";
 
 const LIVE: TaskStatus[] = ["queued", "running", "needs_input", "review"];
@@ -13,21 +16,24 @@ export function Focus({ task }: { task: Task }) {
   const live = LIVE.includes(task.status);
   const files = useChangedFiles(task.id);
   const [confirmDiscard, setConfirmDiscard] = useState(false);
+  const term = useRef<TermControl | null>(null);
   const tabs = s.tasks.filter((t) => t.status !== "done");
+
+  const resume = () => s.run(() => api.resume(task.id));
 
   async function discard() {
     const ok = await s.run(() => api.discard(task.id));
     if (ok !== undefined) {
       s.toast(`Discarded task ${task.id}`);
-      s.go({ name: "stage" });
+      s.go({ name: "overview" });
     }
   }
 
   return (
     <section className="focus">
       <nav className="tabs" aria-label="Open tasks">
-        <button className="tab" onClick={() => s.go({ name: "stage" })}>
-          <Icon name="grid" /> Stage
+        <button className="tab" onClick={() => s.go({ name: "overview" })}>
+          <Icon name="grid" /> Overview
         </button>
         {tabs.map((t, i) => (
           <button
@@ -47,10 +53,32 @@ export function Focus({ task }: { task: Task }) {
           <header className="term-head">
             <span className="task-num">#{task.id}</span>
             <strong className="ellipsis grow">{task.title}</strong>
+            <span className="muted small mono ellipsis term-project" title={`${task.repo} · ${task.branch}`}>
+              {repoName(task.repo)}
+            </span>
             <StatusPill status={task.status} />
             <span className="muted small mono">{task.agent.kind === "claude" ? "claude" : "custom"}</span>
+            <span className="term-nav" role="group" aria-label="Jump between your prompts">
+              <button className="btn term-btn" title="Previous prompt (⌘↑)" aria-label="Previous prompt" onClick={() => term.current?.prevPrompt()}>
+                ↑
+              </button>
+              <button className="btn term-btn" title="Next prompt (⌘↓)" aria-label="Next prompt" onClick={() => term.current?.nextPrompt()}>
+                ↓
+              </button>
+            </span>
+            {live ? (
+              <button className="btn term-btn" onClick={() => s.run(() => api.stop(task.id))}>
+                Stop
+              </button>
+            ) : (
+              task.status !== "done" && (
+                <button className="btn btn-primary term-btn" onClick={resume}>
+                  Resume
+                </button>
+              )
+            )}
           </header>
-          <TerminalView key={task.id} id={task.id} live={live} />
+          <TerminalView key={task.id} id={task.id} live={live} onResume={task.status !== "done" ? resume : undefined} control={term} />
           {task.status === "needs_input" && (
             <div className="term-keys">
               <span className="small">The agent is waiting for you:</span>
@@ -70,6 +98,16 @@ export function Focus({ task }: { task: Task }) {
 
         <aside className="side">
           <section className="panel">
+            <h2>Message the agent</h2>
+            <Composer key={task.id} taskId={task.id} disabled={!live} />
+          </section>
+
+          <TaskContextPanel task={task} />
+
+          <PromptsPanel task={task} term={term} />
+          <ActivityPanel task={task} />
+
+          <section className="panel">
             <h2>
               Changed files <span className="muted">{files.length}</span>
             </h2>
@@ -84,11 +122,6 @@ export function Focus({ task }: { task: Task }) {
             <button className="link-btn small" onClick={() => s.go({ name: "review", id: task.id })}>
               Review diff →
             </button>
-          </section>
-
-          <section className="panel">
-            <h2>Message the agent</h2>
-            <Composer taskId={task.id} disabled={!live} />
           </section>
 
           <section className="panel">

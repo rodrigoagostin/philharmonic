@@ -3,11 +3,13 @@
 //! It listens on a Unix socket. Each client connection is handled in its own
 //! lightweight tokio task, so a slow (or crashing) client never blocks the others.
 
+mod activity_log;
 mod agent;
 mod context_store;
 mod daemon;
 mod git;
 mod handlers;
+mod hooks;
 mod state;
 
 use std::collections::HashMap;
@@ -27,6 +29,7 @@ fn main() -> Result<()> {
     // Changing environment variables is only safe before other threads exist,
     // so this runs before the async runtime starts.
     adopt_login_shell_path();
+    raise_open_file_limit();
 
     tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(run())
 }
@@ -57,16 +60,35 @@ async fn run() -> Result<()> {
     }
     let claude_bin = which("claude").unwrap_or_else(|| "claude".to_string());
 
+    let exe = std::env::current_exe().ok();
     let (events, _) = broadcast::channel(4096);
+    let state = State::load()?;
+    let task_ids: Vec<_> = state.list().iter().map(|t| t.id).collect();
     let d: Shared = Arc::new(Daemon {
-        state: Mutex::new(State::load()?),
+        state: Mutex::new(state),
+        recent: Mutex::new(activity_log::load_recent(&task_ids)),
         procs: Mutex::new(HashMap::new()),
         terms: Mutex::new(HashMap::new()),
         events,
         ph_bin,
         claude_bin,
+        exe_mtime: exe.as_deref().map(daemon::mtime).unwrap_or(0),
+        exe_hash: exe.as_deref().map(philharmonic_core::fingerprint::file).unwrap_or(0),
+        exe,
+        dirty: Default::default(),
+        shutdown: tokio::sync::Notify::new(),
     });
     d.save(); // persists any live → stopped changes from loading
+
+    // Task changes are written to disk by this loop (see `Daemon::update_task`).
+    let saver = Arc::clone(&d);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let d = Arc::clone(&saver);
+            let _ = tokio::task::spawn_blocking(move || d.save_if_dirty()).await;
+        }
+    });
 
     tracing::info!("listening on {}", socket.display());
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -74,7 +96,16 @@ async fn run() -> Result<()> {
         // `select!` waits for whichever happens first: a new client, Ctrl+C, or `kill`.
         tokio::select! {
             accepted = listener.accept() => {
-                let (stream, _addr) = accepted?;
+                // An accept error (e.g. out of file handles) must not take the daemon down,
+                // and every running agent with it: log it, back off a little, keep serving.
+                let stream = match accepted {
+                    Ok((stream, _addr)) => stream,
+                    Err(e) => {
+                        tracing::error!("accepting a connection: {e}");
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        continue;
+                    }
+                };
                 let d = Arc::clone(&d);
                 tokio::spawn(async move {
                     if let Err(e) = handle_connection(stream, d).await {
@@ -84,6 +115,7 @@ async fn run() -> Result<()> {
             }
             _ = tokio::signal::ctrl_c() => break,
             _ = sigterm.recv() => break,
+            _ = d.shutdown.notified() => break,
         }
     }
 
@@ -92,6 +124,16 @@ async fn run() -> Result<()> {
     for id in ids {
         agent::kill(&d, id);
     }
+    // Give the agents a moment to exit (they mark their tasks stopped), then save.
+    for _ in 0..20 {
+        if d.procs.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    // (an agent leaves `procs` just before it updates its task)
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    d.save();
     let _ = std::fs::remove_file(&socket);
     tracing::info!("bye");
     Ok(())
@@ -105,7 +147,7 @@ async fn handle_connection(stream: UnixStream, d: Shared) -> Result<()> {
 
     while let Some(line) = lines.next_line().await? {
         let response = match serde_json::from_str::<Request>(&line) {
-            Ok(Request::Subscribe) => return stream_events(writer, d).await,
+            Ok(Request::Subscribe) => return stream_events(lines, writer, d).await,
             Ok(request) => {
                 if !matches!(request, Request::Input { .. } | Request::Screen { .. } | Request::Resize { .. }) {
                     tracing::info!(?request, "request");
@@ -119,15 +161,27 @@ async fn handle_connection(stream: UnixStream, d: Shared) -> Result<()> {
     Ok(())
 }
 
-async fn stream_events(mut writer: tokio::net::unix::OwnedWriteHalf, d: Shared) -> Result<()> {
+async fn stream_events(
+    mut lines: tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    mut writer: tokio::net::unix::OwnedWriteHalf,
+    d: Shared,
+) -> Result<()> {
     let mut rx = d.events.subscribe();
     write_line(&mut writer, &Response::Ok).await?;
     loop {
-        match rx.recv().await {
-            Ok(event) => write_line(&mut writer, &Response::Event { event }).await?,
-            // A slow client missed some events; keep going (it can re-sync with list calls).
-            Err(broadcast::error::RecvError::Lagged(n)) => tracing::warn!("subscriber lagged by {n} events"),
-            Err(broadcast::error::RecvError::Closed) => return Ok(()),
+        tokio::select! {
+            event = rx.recv() => match event {
+                Ok(event) => write_line(&mut writer, &Response::Event { event }).await?,
+                // A slow client missed some events; keep going (it can re-sync with list calls).
+                Err(broadcast::error::RecvError::Lagged(n)) => tracing::warn!("subscriber lagged by {n} events"),
+                Err(broadcast::error::RecvError::Closed) => return Ok(()),
+            },
+            // Notice right away when the client hangs up. Without this, a closed connection
+            // stays open until the next event, and an idle daemon runs out of file handles.
+            line = lines.next_line() => match line {
+                Ok(Some(_)) => {} // subscribers don't send anything else; ignore it
+                Ok(None) | Err(_) => return Ok(()),
+            },
         }
     }
 }
@@ -154,6 +208,23 @@ fn which(name: &str) -> Option<String> {
         .map(|dir| dir.join(name))
         .find(|p| p.is_file())
         .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Apps started from the Finder/Dock get only 256 open files. Each agent, connection and
+/// git call uses some, so ask for more (up to the hard limit).
+fn raise_open_file_limit() {
+    // SAFETY: getrlimit/setrlimit only read and write the struct we pass in.
+    unsafe {
+        let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
+            // macOS refuses values above OPEN_MAX (10240) even when the hard limit is "unlimited".
+            let wanted = limit.rlim_max.min(10_240);
+            if limit.rlim_cur < wanted {
+                limit.rlim_cur = wanted;
+                libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+            }
+        }
+    }
 }
 
 /// Apps started from the Dock get a minimal PATH, so `claude`, `gh`, etc. wouldn't be found.

@@ -2,6 +2,7 @@ import { useState } from "react";
 import { ago, api, repoName, type Task, type TaskStatus } from "../api";
 import { useScreenText } from "../hooks";
 import { useStore } from "../store";
+import { NowLine } from "./Activity";
 import { Icon, StatusPill, tail } from "./ui";
 
 const ORDER: TaskStatus[] = ["needs_input", "review", "running", "queued", "failed", "stopped", "done"];
@@ -11,7 +12,7 @@ export function Stage() {
   const [showDone, setShowDone] = useState(false);
   const q = s.search.trim().toLowerCase();
 
-  const scoped = s.tasks.filter((t) => !s.repoFilter || t.repo === s.repoFilter);
+  const scoped = s.tasks.filter(s.shown);
   const doneCount = scoped.filter((t) => t.status === "done").length;
   const tasks = scoped
     .filter((t) => showDone || t.status !== "done")
@@ -54,10 +55,10 @@ const LIVE: TaskStatus[] = ["queued", "running", "needs_input", "review"];
 
 function TaskCard({ task }: { task: Task }) {
   const s = useStore();
-  const text = useScreenText(task.id);
+  const live = LIVE.includes(task.status);
+  const text = useScreenText(task.id, live);
   const [reply, setReply] = useState("");
   const waiting = task.status === "needs_input";
-  const live = LIVE.includes(task.status);
   const open = () => s.go({ name: "focus", id: task.id });
 
   async function send(e: React.FormEvent) {
@@ -76,8 +77,11 @@ function TaskCard({ task }: { task: Task }) {
         <StatusPill status={task.status} />
       </header>
       <p className="muted small ellipsis mono">
-        {task.agent.kind === "claude" ? "claude" : "custom"} · {repoName(task.repo)} · {task.branch}
+        {task.agent.kind === "claude" ? "claude" : "custom"} · {repoName(task.repo)}
+        {task.collections.length > 0 && ` (${task.collections.map((id) => s.collection(id)?.name).filter(Boolean).join(", ")})`} ·{" "}
+        {task.branch}
       </p>
+      <NowLine task={task} />
       <pre className="tail" onClick={open}>
         {tail(text, 6) || " "}
       </pre>

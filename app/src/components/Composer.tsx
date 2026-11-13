@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { api, type ContextItem } from "../api";
+import { useDraft } from "../hooks";
 import { useStore } from "../store";
 import { ContextChip } from "./ContextShelf";
 import { contextFromDrop, contextFromPaste, type NewContext } from "./ui";
@@ -7,25 +8,27 @@ import { contextFromDrop, contextFromPaste, type NewContext } from "./ui";
 /** Message box for a running agent. Paste a screenshot or a link and it's attached. */
 export function Composer({ taskId, disabled }: { taskId: number; disabled?: boolean }) {
   const s = useStore();
-  const [text, setText] = useState("");
-  const [attached, setAttached] = useState<number[]>([]);
+  // Kept per task, so switching tabs doesn't lose (or carry over) what you were writing.
+  const [text, setText, files] = useDraft(`task-${taskId}`);
+  const attached = files.ids;
   const [picking, setPicking] = useState(false);
   const task = s.task(taskId);
 
   const byId = new Map(s.context.map((c) => [c.id, c]));
   const items = attached.map((id) => byId.get(id)).filter(Boolean) as ContextItem[];
+  // This task's own items and those of the collections it uses (never other projects').
   const pickable = s.context.filter(
     (c) =>
       !attached.includes(c.id) &&
       ((c.scope.kind === "task" && c.scope.id === taskId) ||
-        c.scope.kind === "inbox" ||
-        (c.scope.kind === "project" && c.scope.repo === task?.repo)),
+        (c.scope.kind === "collection" && (task?.collections ?? []).includes(c.scope.id))),
   );
+  const where = (c: ContextItem) => (c.scope.kind === "collection" ? (s.collection(c.scope.id)?.name ?? "") : "this task");
 
   async function add(list: NewContext[]) {
     for (const c of list) {
       const item = await s.run(() => api.addContext({ scope: { kind: "task", id: taskId }, ...c }));
-      if (item) setAttached((a) => [...a, item.id]);
+      if (item) files.uploaded(item.id);
     }
   }
 
@@ -33,8 +36,7 @@ export function Composer({ taskId, disabled }: { taskId: number; disabled?: bool
     if (disabled || (!text.trim() && !attached.length)) return;
     const ok = await s.run(() => api.send(taskId, text.trim() || "See the attached context.", attached));
     if (ok !== undefined) {
-      setText("");
-      setAttached([]);
+      files.sent();
       s.toast("Sent to the agent");
     }
   }
@@ -73,32 +75,33 @@ export function Composer({ taskId, disabled }: { taskId: number; disabled?: bool
       {items.length > 0 && (
         <div className="chips">
           {items.map((c) => (
-            <ContextChip key={c.id} item={c} onRemove={() => setAttached((a) => a.filter((x) => x !== c.id))} />
+            <ContextChip key={c.id} item={c} onRemove={() => files.remove(c.id)} />
           ))}
         </div>
       )}
       <div className="row">
         <button className="link-btn small" onClick={() => setPicking((p) => !p)} disabled={!pickable.length}>
-          Attach from shelf ({pickable.length})
+          Attach from context ({pickable.length})
         </button>
         <span className="spacer" />
         <button className="btn btn-primary" onClick={send} disabled={disabled || (!text.trim() && !attached.length)}>
           Send <kbd className="kbd kbd-dark">⌘↵</kbd>
         </button>
       </div>
-      {picking && (
+      {picking && pickable.length > 0 && (
         <div className="picker">
           {pickable.map((c) => (
             <button
               key={c.id}
               className="picker-row"
               onClick={() => {
-                setAttached((a) => [...a, c.id]);
+                files.pick(c.id);
                 setPicking(false);
               }}
             >
-              <ContextChip item={c} />
-              <span className="muted small">{c.scope.kind}</span>
+              {/* ✕ deletes it from the shelf (attaching is the row itself). */}
+              <ContextChip item={c} onRemove={() => s.run(() => api.removeContext(c.id))} />
+              <span className="muted small">{where(c)}</span>
             </button>
           ))}
         </div>

@@ -119,7 +119,7 @@ export function Review({ task }: { task: Task }) {
     const ok = await s.run(() => api.discard(task.id));
     if (ok !== undefined) {
       s.toast(`Discarded task ${task.id}`);
-      s.go({ name: "stage" });
+      s.go({ name: "overview" });
     }
   }
 

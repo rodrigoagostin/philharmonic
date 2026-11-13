@@ -17,14 +17,17 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::context::{ContextId, ContextItem, ContextKind, Scope};
+use crate::activity::Activity;
+use crate::context::{Collection, CollectionId, ContextId, ContextItem, ContextKind, Scope};
 use crate::task::{Agent, Task, TaskId};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
-    /// Health check: is the daemon alive?
+    /// Health check: is the daemon alive? (and which build is it running?)
     Ping,
+    /// Stop every agent and exit (used to restart the daemon after an update).
+    Shutdown,
 
     // ---- tasks ----
     /// Create a worktree + branch and start the agent in it.
@@ -34,6 +37,9 @@ pub enum Request {
         repo: PathBuf,
         /// Branch to start from, e.g. `main`.
         base: String,
+        /// Name of the new branch (e.g. `feature/ABC-123-login`). Empty: `ph/<from the prompt>`.
+        #[serde(default)]
+        branch: Option<String>,
         #[serde(default = "default_agent")]
         agent: Agent,
         #[serde(default)]
@@ -43,6 +49,9 @@ pub enum Request {
         /// Context items to attach to the first prompt (they move to the task's scope).
         #[serde(default)]
         context: Vec<ContextId>,
+        /// Collections the task uses. Missing: the ones linked to `repo`.
+        #[serde(default)]
+        collections: Option<Vec<CollectionId>>,
     },
     ListTasks,
     /// Kill the agent process (the worktree stays).
@@ -59,7 +68,12 @@ pub enum Request {
     Input { id: TaskId, data: String },
     Resize { id: TaskId, cols: u16, rows: u16 },
     /// Current terminal contents: full byte history (to replay) + visible text.
-    Screen { id: TaskId },
+    /// `history: false` skips the history (it can be megabytes; previews only need the text).
+    Screen {
+        id: TaskId,
+        #[serde(default = "yes")]
+        history: bool,
+    },
     /// Type a message into the agent (pasted, then Enter), with context items attached.
     Send {
         id: TaskId,
@@ -69,15 +83,24 @@ pub enum Request {
     },
 
     // ---- from Claude Code hooks (via `ph notify`) ----
-    Notify {
-        id: TaskId,
-        event: HookEvent,
+    /// A hook fired inside a task's agent. `payload` is the JSON Claude Code gave the hook
+    /// (`hook_event_name`, `tool_name`, `tool_input`, `agent_id`, …).
+    Hook { id: TaskId, payload: serde_json::Value },
+    /// The activity log: one task's (oldest first), or every task's most recent.
+    Activity {
         #[serde(default)]
-        message: String,
+        id: Option<TaskId>,
+        #[serde(default = "default_limit")]
+        limit: usize,
     },
 
     // ---- review & ship ----
-    Diff { id: TaskId },
+    /// `patch: false` = only the list of changed files (cheap, for live panels).
+    Diff {
+        id: TaskId,
+        #[serde(default = "yes")]
+        patch: bool,
+    },
     Ship { id: TaskId, how: ShipMethod },
 
     // ---- context shelf ----
@@ -97,6 +120,22 @@ pub enum Request {
     MoveContext { id: ContextId, scope: Scope },
     RemoveContext { id: ContextId },
 
+    // ---- collections ----
+    ListCollections,
+    /// Create (no `id`) or rename / relink a collection.
+    SaveCollection {
+        #[serde(default)]
+        id: Option<CollectionId>,
+        name: String,
+        #[serde(default)]
+        repos: Vec<PathBuf>,
+    },
+    /// Delete a collection and its items (tasks stop using it).
+    DeleteCollection { id: CollectionId },
+    /// Which collections a task uses. A running agent hears about added ones with your
+    /// next message.
+    SetTaskCollections { id: TaskId, collections: Vec<CollectionId> },
+
     // ---- misc ----
     /// Local branches of a repo (for the base-branch picker).
     Branches { repo: PathBuf },
@@ -108,16 +147,12 @@ fn default_agent() -> Agent {
     Agent::Claude
 }
 
-/// What a Claude Code hook reports.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HookEvent {
-    /// The agent is working (a prompt was submitted, or a tool finished).
-    Running,
-    /// The agent is waiting for you (a permission prompt or a question).
-    NeedsInput,
-    /// The agent finished its turn.
-    Stopped,
+fn yes() -> bool {
+    true
+}
+
+fn default_limit() -> usize {
+    300
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,7 +174,22 @@ pub struct FileChange {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
-    Pong { version: String },
+    Pong {
+        version: String,
+        /// The daemon's process id.
+        #[serde(default)]
+        pid: u32,
+        /// The binary it runs, and that file's modification time (Unix seconds) when it
+        /// started. If the file on disk is newer now, this daemon is running an old build.
+        #[serde(default)]
+        exe: Option<PathBuf>,
+        #[serde(default)]
+        exe_mtime: u64,
+        /// Fingerprint of that binary's contents at startup (see `fingerprint::file`).
+        /// 0 from builds before this field existed.
+        #[serde(default)]
+        exe_hash: u64,
+    },
     Ok,
     TaskCreated { task: Task },
     Task { task: Task },
@@ -149,6 +199,12 @@ pub enum Response {
         history: String,
         /// The visible screen as plain text, trailing blank lines removed.
         text: String,
+        /// The terminal's current size. Replay `history` at this size: the agent's redraws
+        /// (cursor moves) only line up at the size they were drawn at.
+        #[serde(default)]
+        cols: u16,
+        #[serde(default)]
+        rows: u16,
     },
     Diff {
         files: Vec<FileChange>,
@@ -158,7 +214,10 @@ pub enum Response {
     Shipped { message: String },
     ContextAdded { item: ContextItem },
     Context { items: Vec<ContextItem> },
+    Collection { collection: Collection },
+    Collections { collections: Vec<Collection> },
     Branches { names: Vec<String> },
+    Activity { items: Vec<Activity> },
     Event { event: Event },
     Error { message: String },
 }
@@ -171,7 +230,10 @@ pub enum Event {
     TaskRemoved { id: TaskId },
     /// New terminal output (base64).
     Output { id: TaskId, data: String },
+    /// Context items or collections changed: reload them.
     ContextChanged,
+    /// Something an agent did (also kept in the task's activity log).
+    Activity { item: Activity },
 }
 
 #[cfg(test)]

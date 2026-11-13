@@ -11,9 +11,11 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
-use philharmonic_core::{Agent, Event, Task, TaskId, TaskStatus, paths};
+use philharmonic_core::{ActivityKind, Agent, CollectionId, Event, Scope, Task, TaskId, TaskStatus, paths};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
+use crate::activity_log::record;
+use crate::context_store;
 use crate::daemon::Shared;
 
 /// Max bytes of output we keep per task (older output is dropped).
@@ -28,6 +30,8 @@ pub struct Proc {
     killer: Box<dyn ChildKiller + Send + Sync>,
     /// Set when *we* stop it, so an exit isn't reported as a failure.
     stopping: bool,
+    /// Collections this agent was told about (at start, or with a later message).
+    briefed: Vec<CollectionId>,
 }
 
 /// What the agent printed: raw bytes (to replay in a terminal widget) plus a parsed screen
@@ -45,8 +49,12 @@ impl Terminal {
     fn feed(&mut self, bytes: &[u8]) {
         self.parser.process(bytes);
         self.history.extend_from_slice(bytes);
-        if self.history.len() > HISTORY_CAP {
-            let cut = self.history.len() - HISTORY_CAP;
+        // Trim in batches (when 25% over the cap), not on every chunk: dropping the front
+        // moves everything after it, and a busy agent sends many small chunks a second.
+        if self.history.len() > HISTORY_CAP + HISTORY_CAP / 4 {
+            let over = self.history.len() - HISTORY_CAP;
+            // Cut just after a newline, so the replay doesn't start inside an escape sequence.
+            let cut = self.history[over..].iter().position(|&b| b == b'\n').map_or(over, |i| over + i + 1);
             self.history.drain(..cut);
         }
     }
@@ -95,7 +103,8 @@ pub fn spawn(d: &Shared, task: &Task, start: Start) -> Result<()> {
 
     let id = task.id;
     d.terms.lock().unwrap().entry(id).or_insert_with(Terminal::new);
-    d.procs.lock().unwrap().insert(id, Proc { writer, master: pair.master, killer, stopping: false });
+    let briefed = task.collections.clone();
+    d.procs.lock().unwrap().insert(id, Proc { writer, master: pair.master, killer, stopping: false, briefed });
 
     // Reading a PTY blocks, so it gets a plain OS thread rather than an async task.
     let reader_daemon = d.clone();
@@ -125,6 +134,11 @@ pub fn spawn(d: &Shared, task: &Task, start: Start) -> Result<()> {
         }
     });
 
+    record(d, id, None, ActivityKind::Lifecycle, format!("Started {}", match &task.agent {
+        Agent::Claude => "Claude Code".to_string(),
+        Agent::Custom { command } => format!("`{command}`"),
+    }));
+
     // Another thread waits for the process to exit and updates the task.
     let waiter_daemon = d.clone();
     std::thread::spawn(move || {
@@ -142,7 +156,17 @@ pub fn spawn(d: &Shared, task: &Task, start: Start) -> Result<()> {
             if t.status.is_live() {
                 t.status = if success || stopped_by_us { TaskStatus::Stopped } else { TaskStatus::Failed };
             }
+            // Nothing is running any more.
+            t.doing = None;
+            for s in &mut t.subagents {
+                if s.running {
+                    s.running = false;
+                    s.doing = None;
+                }
+            }
         });
+        let how = if stopped_by_us { "Stopped" } else if success { "Agent exited" } else { "Agent crashed" };
+        record(&waiter_daemon, id, None, ActivityKind::Lifecycle, how);
         tracing::info!(task = id, success, "agent exited");
     });
 
@@ -150,16 +174,46 @@ pub fn spawn(d: &Shared, task: &Task, start: Start) -> Result<()> {
 }
 
 fn command_for(d: &Shared, task: &Task, start: Start) -> Result<CommandBuilder> {
+    // Its context: the collections the task uses, plus the task's own folder (screenshots
+    // pasted into its message box). `--add-dir` lets the agent read them without asking.
+    let brief = context_store::brief(d, &task.collections, CONTEXT_INTRO);
+    let mut dirs = brief.as_ref().map(|(_, dirs)| dirs.clone()).unwrap_or_default();
+    if let Ok(own) = context_store::scope_dir(&Scope::Task { id: task.id }) {
+        let _ = std::fs::create_dir_all(&own);
+        dirs.push(own);
+    }
     let mut cmd = match &task.agent {
         Agent::Claude => {
             let mut cmd = CommandBuilder::new(&d.claude_bin);
+            // What Claude Code remembers per folder (MCP servers you added "for this project",
+            // which `.mcp.json` servers you approved) is keyed by your checkout's path. The
+            // worktree is another path, so hand those over explicitly.
+            let local = project_entry(&task.repo);
+            let mut settings = hook_settings(&d.ph_bin);
+            for key in ["enabledMcpjsonServers", "disabledMcpjsonServers"] {
+                if let Some(list) = local.get(key).filter(|v| v.as_array().is_some_and(|a| !a.is_empty())) {
+                    settings[key] = list.clone();
+                }
+            }
             cmd.arg("--settings");
-            cmd.arg(hook_settings(&d.ph_bin));
+            cmd.arg(settings.to_string());
+            if let Some(servers) = local.get("mcpServers").filter(|v| v.as_object().is_some_and(|o| !o.is_empty())) {
+                // `--mcp-config` takes several values, so use `=`: otherwise it would also
+                // swallow the prompt that comes after it.
+                cmd.arg(format!("--mcp-config={}", serde_json::json!({ "mcpServers": servers })));
+            }
             if let Some(model) = &task.model {
                 cmd.args(["--model", model]);
             }
             if task.auto_approve {
                 cmd.args(["--permission-mode", "acceptEdits"]);
+            }
+            // `=`: both options take several values and would swallow what follows.
+            for dir in &dirs {
+                cmd.arg(format!("--add-dir={}", dir.display()));
+            }
+            if let Some((text, _)) = &brief {
+                cmd.arg(format!("--append-system-prompt={text}"));
             }
             match start {
                 Start::Fresh { prompt } => cmd.arg(prompt),
@@ -173,6 +227,11 @@ fn command_for(d: &Shared, task: &Task, start: Start) -> Result<CommandBuilder> 
             if let Start::Fresh { prompt } = start {
                 cmd.env("PH_PROMPT", prompt);
             }
+            // The same context, for whatever the command wants to do with it.
+            if let Some((text, _)) = &brief {
+                cmd.env("PH_CONTEXT", text);
+            }
+            cmd.env("PH_CONTEXT_DIRS", std::env::join_paths(&dirs).unwrap_or_default());
             cmd
         }
     };
@@ -184,6 +243,13 @@ fn command_for(d: &Shared, task: &Task, start: Start) -> Result<CommandBuilder> 
             cmd.env_remove(key);
         }
     }
+    if task.agent == Agent::Claude {
+        // Print the conversation as normal terminal output instead of a full-screen view.
+        // Scrolling then happens in the app's own terminal (instant), instead of every wheel
+        // tick and mouse movement being sent to Claude Code, which redraws for each one.
+        cmd.env("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN", "1");
+        cmd.env("CLAUDE_CODE_DISABLE_MOUSE", "1");
+    }
     // Hooks (`ph notify`) use these to find the task and the daemon.
     cmd.env("PH_TASK_ID", task.id.to_string());
     cmd.env("PHILHARMONIC_HOME", paths::data_dir()?);
@@ -192,23 +258,54 @@ fn command_for(d: &Shared, task: &Task, start: Start) -> Result<CommandBuilder> 
     Ok(cmd)
 }
 
+/// Opens the brief about the task's collections (see `context_store::brief`).
+const CONTEXT_INTRO: &str = "# Context for this task (from Philharmonic)\n\
+The user runs several tasks at once, across different projects and features. This task \
+uses the collections below: material the user gathered for it (docs, designs, \
+screenshots, links, notes). Open a file when it's relevant to what you're doing. Only \
+these belong to this task. Their folders can get new files while you work.";
+
 /// Claude Code settings (passed with `--settings`, so nothing is written into your repo)
 /// that call `ph notify` on each status change.
-fn hook_settings(ph: &Path) -> String {
-    let hook = |event: &str| {
-        serde_json::json!([{ "hooks": [{ "type": "command", "command": format!("'{}' notify {event}", ph.display()) }] }])
+fn hook_settings(ph: &Path) -> serde_json::Value {
+    // Every hook runs the same command; `ph notify` forwards the hook's JSON to the daemon,
+    // which looks at `hook_event_name`.
+    let command = format!("'{}' notify", ph.display());
+    let hook = |matcher: bool| {
+        let mut h = serde_json::json!([{ "hooks": [{ "type": "command", "command": command, "timeout": 10 }] }]);
+        if matcher {
+            h[0]["matcher"] = serde_json::json!("*");
+        }
+        h
     };
-    let mut post_tool = hook("running");
-    post_tool[0]["matcher"] = serde_json::json!("*");
     serde_json::json!({
         "hooks": {
-            "UserPromptSubmit": hook("running"),
-            "PostToolUse": post_tool,
-            "Notification": hook("needs_input"),
-            "Stop": hook("stopped"),
+            "UserPromptSubmit": hook(false),
+            "PreToolUse": hook(true),
+            "PostToolUse": hook(true),
+            "SubagentStart": hook(false),
+            "SubagentStop": hook(false),
+            "Notification": hook(false),
+            "Stop": hook(false),
         }
     })
-    .to_string()
+}
+
+/// Claude Code's per-folder entry for `repo` in its config file (`~/.claude.json`, or
+/// `$CLAUDE_CONFIG_DIR/.claude.json`). `Null` if there's none.
+fn project_entry(repo: &Path) -> serde_json::Value {
+    let file = match std::env::var_os("CLAUDE_CONFIG_DIR") {
+        Some(dir) => std::path::PathBuf::from(dir).join(".claude.json"),
+        None => match std::env::var_os("HOME") {
+            Some(home) => std::path::PathBuf::from(home).join(".claude.json"),
+            None => return serde_json::Value::Null,
+        },
+    };
+    let config: serde_json::Value = std::fs::read(&file)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    config["projects"][repo.to_string_lossy().as_ref()].clone()
 }
 
 // ---- talking to a running agent ----
@@ -231,11 +328,15 @@ pub fn resize(d: &Shared, id: TaskId, cols: u16, rows: u16) -> Result<()> {
     Ok(())
 }
 
-/// (history as base64, visible text)
-pub fn screen(d: &Shared, id: TaskId) -> (String, String) {
+/// (history as base64, visible text, cols, rows)
+pub fn screen(d: &Shared, id: TaskId, with_history: bool) -> (String, String, u16, u16) {
     match d.terms.lock().unwrap().get(&id) {
-        Some(term) => (B64.encode(&term.history), term.text()),
-        None => (String::new(), String::new()),
+        Some(term) => {
+            let (rows, cols) = term.parser.screen().size();
+            let history = if with_history { B64.encode(&term.history) } else { String::new() };
+            (history, term.text(), cols.get(), rows.get())
+        }
+        None => (String::new(), String::new(), DEFAULT_COLS, DEFAULT_ROWS),
     }
 }
 
@@ -260,6 +361,20 @@ pub fn kill(d: &Shared, id: TaskId) -> bool {
             true
         }
         None => false,
+    }
+}
+
+/// Of `collections`, the ones the task's running agent hasn't been told about.
+pub fn unbriefed(d: &Shared, id: TaskId, collections: &[CollectionId]) -> Vec<CollectionId> {
+    match d.procs.lock().unwrap().get(&id) {
+        Some(p) => collections.iter().copied().filter(|c| !p.briefed.contains(c)).collect(),
+        None => Vec::new(),
+    }
+}
+
+pub fn mark_briefed(d: &Shared, id: TaskId, collections: &[CollectionId]) {
+    if let Some(p) = d.procs.lock().unwrap().get_mut(&id) {
+        p.briefed.extend_from_slice(collections);
     }
 }
 

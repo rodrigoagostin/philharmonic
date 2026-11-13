@@ -3,14 +3,17 @@
 //! Keeping these in their own crate means the daemon and the clients can never disagree
 //! about what a `Task` or a `Request` looks like: if one changes, both recompile.
 
+pub mod activity;
 pub mod context;
+pub mod fingerprint;
 pub mod paths;
 pub mod protocol;
 pub mod slug;
 pub mod task;
 
-pub use context::{ContextId, ContextItem, ContextKind, Scope};
-pub use protocol::{Event, FileChange, HookEvent, Request, Response, ShipMethod};
+pub use activity::{Activity, ActivityKind, PlanItem, Subagent, Usage};
+pub use context::{Collection, CollectionId, ContextId, ContextItem, ContextKind, Scope};
+pub use protocol::{Event, FileChange, Request, Response, ShipMethod};
 pub use task::{Agent, Task, TaskId, TaskStatus};
 
 /// Seconds since 1970 (for `created_at` fields).

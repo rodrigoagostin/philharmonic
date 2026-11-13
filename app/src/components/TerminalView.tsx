@@ -1,10 +1,55 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, type RefObject } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { WebglAddon } from "@xterm/addon-webgl";
 import { api, b64ToBytes, onOutput } from "../api";
 
+/** Lets the Focus view move around the terminal (jump to a prompt, previous/next prompt). */
+export interface TermControl {
+  /** Scroll to the prompt that starts with `text` (or the `index`-th prompt). False if it's not in the scrollback. */
+  jumpToPrompt: (text: string, index: number) => boolean;
+  /** The prompts visible in the scrollback, oldest first (first line of each). */
+  prompts: () => string[];
+  prevPrompt: () => void;
+  nextPrompt: () => void;
+  /** The program switched to the full-screen buffer (no scrollback to jump through). */
+  isFullScreen: () => boolean;
+  /** Called when the program enters or leaves full-screen mode. */
+  onFullScreenChange?: (fullScreen: boolean) => void;
+}
+
+/** The first characters we compare: enough to tell prompts apart, short enough to fit one line. */
+export const norm = (s: string) => s.replace(/\s+/g, " ").trim().slice(0, 40);
+
+/**
+ * Lines where Claude Code shows a prompt you sent: `❯ your text`. The input box at the bottom
+ * also starts with `❯`, but it sits between two `───` rules, so it's skipped.
+ */
+function promptLines(term: Terminal): { y: number; text: string }[] {
+  const buf = term.buffer.active;
+  const line = (y: number) => buf.getLine(y)?.translateToString(true) ?? "";
+  const found: { y: number; text: string }[] = [];
+  for (let y = 0; y < buf.length; y++) {
+    const text = line(y);
+    if (!text.startsWith("❯ ") || !text.slice(2).trim()) continue;
+    const isInputBox = line(y - 1).startsWith("─") && line(y + 1).startsWith("─");
+    if (!isInputBox) found.push({ y, text: text.slice(2) });
+  }
+  return found;
+}
+
 /** The agent's real terminal: what you type goes straight to its PTY. */
-export function TerminalView({ id, live }: { id: number; live: boolean }) {
+export function TerminalView({
+  id,
+  live,
+  onResume,
+  control,
+}: {
+  id: number;
+  live: boolean;
+  onResume?: () => void;
+  control?: RefObject<TermControl | null>;
+}) {
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -14,43 +59,116 @@ export function TerminalView({ id, live }: { id: number; live: boolean }) {
       fontSize: 13,
       lineHeight: 1.2,
       cursorBlink: true,
-      scrollback: 10000,
+      scrollback: 5000,
       allowProposedApi: true,
       theme: { background: "#18181b", foreground: "#e4e4e7" },
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(el);
+    // Draw with the GPU: far less CPU and smooth scrolling. If WebGL isn't available or the
+    // context is lost, xterm falls back to its (slower) DOM renderer.
+    try {
+      const webgl = new WebglAddon();
+      webgl.onContextLoss(() => webgl.dispose());
+      term.loadAddon(webgl);
+    } catch {
+      /* DOM renderer */
+    }
 
     // Subscribe first, buffer until the history is written, so nothing is lost or doubled.
     let ready = false;
     const pending: Uint8Array[] = [];
     const off = onOutput(id, (bytes) => (ready ? term.write(bytes) : pending.push(bytes)));
     let alive = true;
+    // Replay at the size the output was drawn at, *then* fit to the window: the agent redraws
+    // with relative cursor moves, which only land in the right place at the original size.
+    // The resize afterwards makes it redraw cleanly at the new size.
+    const start = () => {
+      if (!alive) return;
+      pending.forEach((b) => term.write(b));
+      pending.length = 0;
+      ready = true;
+      fitAndResize();
+    };
     api
       .screen(id)
       .then((r) => {
         if (!alive) return;
-        term.write(b64ToBytes(r.history));
+        if (r.cols > 0 && r.rows > 0) term.resize(r.cols, r.rows);
+        term.write(b64ToBytes(r.history), start);
       })
-      .catch(() => {})
-      .finally(() => {
-        if (!alive) return;
-        pending.forEach((b) => term.write(b));
-        pending.length = 0;
-        ready = true;
-      });
+      .catch(start);
 
+    // Typing/pasting can produce many tiny chunks; send them together (one request per ~10ms).
+    // Plain mouse-movement reports (SGR button 35) are dropped: some programs ask for every
+    // movement, which would mean a request per pixel the mouse moves.
     const enc = new TextEncoder();
-    const d1 = term.onData((data) => api.input(id, enc.encode(data)).catch(() => {}));
+    let queued = "";
+    let flushTimer: ReturnType<typeof setTimeout> | undefined;
+    const flush = () => {
+      flushTimer = undefined;
+      if (queued) api.input(id, enc.encode(queued)).catch(() => {});
+      queued = "";
+    };
+    const d1 = term.onData((data) => {
+      const filtered = data.replace(/\x1b\[<35;\d+;\d+M/g, "");
+      if (!filtered) return;
+      queued += filtered;
+      if (!flushTimer) flushTimer = setTimeout(flush, 10);
+    });
     const d2 = term.onBinary((data) => {
       const bytes = new Uint8Array(data.length);
       for (let i = 0; i < data.length; i++) bytes[i] = data.charCodeAt(i) & 0xff;
       api.input(id, bytes).catch(() => {});
     });
 
+    // ---- jumping between prompts ----
+    let clearSelection: ReturnType<typeof setTimeout> | undefined;
+    const show = (y: number) => {
+      term.scrollToLine(Math.max(0, y - 1)); // one line of context above
+      term.selectLines(y, y); // highlight it for a moment
+      if (clearSelection) clearTimeout(clearSelection);
+      clearSelection = setTimeout(() => term.clearSelection(), 1500);
+    };
+    const step = (dir: 1 | -1) => {
+      const top = term.buffer.active.viewportY + 1; // the line just under the context line
+      const lines = promptLines(term).map((p) => p.y);
+      const target = dir === 1 ? lines.find((y) => y > top) : lines.reverse().find((y) => y < top);
+      if (target !== undefined) show(target);
+      else if (dir === 1) term.scrollToBottom();
+    };
+    if (control) {
+      control.current = {
+        jumpToPrompt: (text, index) => {
+          const lines = promptLines(term);
+          const want = norm(text.split("\n").find((l) => l.trim()) ?? "");
+          // Match by text; long or multi-line pastes are shown collapsed ("[Pasted text #1]"),
+          // so fall back to position when every prompt is on screen.
+          const byText = want ? lines.find((l) => norm(l.text).startsWith(want) || want.startsWith(norm(l.text))) : undefined;
+          const target = byText ?? lines[index];
+          if (!target) return false;
+          show(target.y);
+          return true;
+        },
+        prompts: () => promptLines(term).map((p) => p.text.trimEnd()),
+        prevPrompt: () => step(-1),
+        nextPrompt: () => step(1),
+        isFullScreen: () => term.buffer.active.type === "alternate",
+      };
+    }
+    const d3 = term.buffer.onBufferChange((b) => control?.current?.onFullScreenChange?.(b.type === "alternate"));
+    // ⌘↑ / ⌘↓ inside the terminal: previous / next prompt (instead of sending them to the agent).
+    term.attachCustomKeyEventHandler((e) => {
+      if (e.type === "keydown" && e.metaKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
+        step(e.key === "ArrowUp" ? -1 : 1);
+        return false;
+      }
+      return true;
+    });
+
     let last = "";
-    const ro = new ResizeObserver(() => {
+    function fitAndResize() {
       try {
         fit.fit();
       } catch {
@@ -61,24 +179,43 @@ export function TerminalView({ id, live }: { id: number; live: boolean }) {
         last = size;
         api.resize(id, term.cols, term.rows).catch(() => {});
       }
-    });
+    }
+    // Until the history is replayed, keep the original size (see above).
+    const ro = new ResizeObserver(() => ready && fitAndResize());
     ro.observe(el);
     term.focus();
 
     return () => {
       alive = false;
+      if (control) control.current = null;
+      if (clearSelection) clearTimeout(clearSelection);
+      if (flushTimer) clearTimeout(flushTimer);
+      flush();
       off();
       ro.disconnect();
       d1.dispose();
       d2.dispose();
+      d3.dispose();
       term.dispose();
     };
-  }, [id]);
+  }, [id, control]);
 
   return (
     <div className="terminal-wrap">
       <div className="terminal" ref={ref} />
-      {!live && <div className="terminal-overlay">The agent isn't running. Resume it to continue.</div>}
+      {!live && (
+        <div className="terminal-overlay">
+          <div className="overlay-box">
+            <p>The agent isn't running.</p>
+            {onResume && (
+              <button className="btn btn-primary" onClick={onResume}>
+                Resume agent
+              </button>
+            )}
+            <p className="small">It continues the same conversation, in the same worktree.</p>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

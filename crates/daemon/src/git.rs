@@ -72,6 +72,45 @@ pub async fn create(repo: &Path, branch: &str, base: &str, dest: &Path) -> Resul
     Ok(())
 }
 
+/// Check a branch name you typed (`git check-ref-format --branch`) and return it cleaned up.
+pub async fn check_branch_name(repo: &Path, name: &str) -> Result<String> {
+    git(repo, &["check-ref-format", "--branch", name])
+        .await
+        .map(|out| out.trim().to_string())
+        .map_err(|_| anyhow::anyhow!("\"{name}\" isn't a valid branch name"))
+}
+
+/// Local files that Claude Code reads but that are normally not committed.
+const CLAUDE_LOCAL_FILES: [&str; 2] = [".claude/settings.local.json", "CLAUDE.local.md"];
+
+/// Copy files git doesn't track from your checkout into a new worktree (which only has
+/// tracked files): your local Claude settings, plus anything matching the patterns in the
+/// repo's `.worktreeinclude` (gitignore syntax, the same file Claude Code's own `--worktree`
+/// reads), e.g. `.env`. Files already in the worktree are left alone. Returns what was copied.
+pub async fn copy_untracked(repo: &Path, worktree: &Path) -> Result<Vec<String>> {
+    let mut files: Vec<String> = CLAUDE_LOCAL_FILES.iter().map(|f| f.to_string()).collect();
+    let include = repo.join(".worktreeinclude");
+    if include.is_file() {
+        let listed = git(repo, &["ls-files", "--others", "--ignored", "--exclude-from", &include.to_string_lossy()]).await?;
+        files.extend(listed.lines().filter(|l| !l.is_empty()).map(str::to_string));
+    }
+    let mut copied = Vec::new();
+    for rel in files {
+        let (from, to) = (repo.join(&rel), worktree.join(&rel));
+        if !from.is_file() || to.exists() {
+            continue;
+        }
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(&from, &to)?;
+        copied.push(rel);
+    }
+    copied.sort();
+    copied.dedup();
+    Ok(copied)
+}
+
 /// Run `git -C <dir> <args…>`. Returns stdout, or an error carrying git's stderr.
 async fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git").arg("-C").arg(dir).args(args).output().await?;
@@ -93,13 +132,13 @@ pub async fn branches(repo: &Path) -> Result<Vec<String>> {
 
 /// Everything the task changed since its branch left `base`, including uncommitted and
 /// new files: (per-file +/- counts, unified diff).
-pub async fn diff(worktree: &Path, base: &str) -> Result<(Vec<FileChange>, String)> {
+pub async fn diff(worktree: &Path, base: &str, with_patch: bool) -> Result<(Vec<FileChange>, String)> {
     // Mark new files as "intent to add" so `git diff` shows them too. Harmless if none.
     let _ = git(worktree, &["add", "--intent-to-add", "--all"]).await;
     let merge_base = git(worktree, &["merge-base", base, "HEAD"]).await?;
     let merge_base = merge_base.trim();
 
-    let patch = git(worktree, &["diff", merge_base]).await?;
+    let patch = if with_patch { git(worktree, &["diff", merge_base]).await? } else { String::new() };
     let numstat = git(worktree, &["diff", "--numstat", merge_base]).await?;
     let files = numstat
         .lines()
