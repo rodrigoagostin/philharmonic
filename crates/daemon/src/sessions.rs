@@ -9,11 +9,12 @@
 //! This isn't a documented format, so everything here is defensive: unreadable files and
 //! lines we don't understand are skipped, never errors.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+use philharmonic_core::{Editor, Subagent};
 use serde_json::Value;
 
 /// `~/.claude`, or `$CLAUDE_CONFIG_DIR` if you set it.
@@ -169,37 +170,120 @@ fn shorten(text: &str, max: usize) -> String {
 const EDIT_TOOLS: [(&str, &str); 4] =
     [("Edit", "file_path"), ("MultiEdit", "file_path"), ("Write", "file_path"), ("NotebookEdit", "notebook_path")];
 
-/// Files a conversation edited (with its subagents), absolute. Files changed some other way
-/// (a shell command) aren't known. Cheap to call again: each transcript is read once, then
-/// only what was appended since.
-pub fn touched_files(cwd: &Path, session: &str) -> Vec<PathBuf> {
-    let Some(projects) = claude_dir().map(|d| d.join("projects")) else { return vec![] };
+/// Where a conversation's transcript is: usually in its folder's directory, otherwise
+/// looked up in all of them.
+fn transcript(cwd: &Path, session: &str) -> Option<PathBuf> {
+    let projects = claude_dir()?.join("projects");
     let file = format!("{session}.jsonl");
-    // Usually in the folder's directory; otherwise look in all of them.
-    let main = projects.join(encode(cwd)).join(&file);
-    let main = if main.exists() {
-        main
-    } else {
-        let found = std::fs::read_dir(&projects)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|d| d.path().join(&file))
-            .find(|p| p.exists());
-        match found {
-            Some(p) => p,
-            None => return vec![],
+    let usual = projects.join(encode(cwd)).join(&file);
+    if usual.exists() {
+        return Some(usual);
+    }
+    std::fs::read_dir(&projects).ok()?.flatten().map(|d| d.path().join(&file)).find(|p| p.exists())
+}
+
+/// The subagents' transcripts: `<session>/subagents/agent-<id>.jsonl`, as (id, path).
+fn subagent_transcripts(main: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(files) = std::fs::read_dir(main.with_extension("").join("subagents")) else { return vec![] };
+    files
+        .flatten()
+        .map(|f| f.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
+        .filter_map(|p| {
+            let id = p.file_stem()?.to_str()?.strip_prefix("agent-")?.to_string();
+            Some((id, p))
+        })
+        .collect()
+}
+
+/// `agent-<id>.meta.json`: Claude Code's (type, description) of a subagent.
+fn subagent_meta(transcript: &Path) -> (String, String) {
+    let meta = transcript.with_extension("meta.json");
+    let v: Value = std::fs::read_to_string(meta).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    let text = |k: &str| v[k].as_str().unwrap_or_default().trim().to_string();
+    (text("agentType"), text("description"))
+}
+
+fn subagent_name(kind: &str, description: &str) -> String {
+    match (description.is_empty(), kind.is_empty()) {
+        (false, _) => description.to_string(),
+        (true, false) => kind.to_string(),
+        (true, true) => "subagent".to_string(),
+    }
+}
+
+/// Files a conversation edited (absolute), and which of its agents edited each: the main
+/// agent and its subagents. Files changed some other way (a shell command) aren't known.
+/// Cheap to call again: each transcript is read once, then only what was appended since.
+pub fn edits(cwd: &Path, session: &str) -> BTreeMap<PathBuf, Vec<Editor>> {
+    let Some(main) = transcript(cwd, session) else { return BTreeMap::new() };
+    let mut agents = vec![(Editor { agent: String::new(), name: "main".to_string() }, main.clone())];
+    for (id, path) in subagent_transcripts(&main) {
+        let (kind, description) = subagent_meta(&path);
+        agents.push((Editor { agent: id, name: subagent_name(&kind, &description) }, path));
+    }
+    let mut out: BTreeMap<PathBuf, Vec<Editor>> = BTreeMap::new();
+    for (editor, path) in agents {
+        for file in edits_in(&path, cwd) {
+            out.entry(file).or_default().push(editor.clone());
         }
-    };
-    let mut transcripts = vec![main.clone()];
-    if let Ok(subs) = std::fs::read_dir(main.with_extension("").join("subagents")) {
-        transcripts.extend(subs.flatten().map(|f| f.path()).filter(|p| p.extension().is_some_and(|e| e == "jsonl")));
     }
-    let mut all = std::collections::BTreeSet::new();
-    for t in transcripts {
-        all.extend(edits_in(&t, cwd));
+    out
+}
+
+/// The subagents a conversation launched, rebuilt from their transcripts (for threads that
+/// ran outside Philharmonic, where no hook reported them). Newest last.
+pub fn subagents(cwd: &Path, session: &str) -> Vec<Subagent> {
+    let Some(main) = transcript(cwd, session) else { return vec![] };
+    let mut out: Vec<Subagent> = subagent_transcripts(&main)
+        .into_iter()
+        .map(|(id, path)| {
+            let (kind, description) = subagent_meta(&path);
+            let meta = std::fs::metadata(&path).ok();
+            let secs = |t: std::io::Result<std::time::SystemTime>| {
+                t.ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0)
+            };
+            let ended = meta.as_ref().map(|m| secs(m.modified())).unwrap_or(0);
+            let started = meta.as_ref().map(|m| secs(m.created())).filter(|s| *s > 0).unwrap_or(ended);
+            let (tool_calls, result) = summarize(&path);
+            Subagent {
+                id,
+                kind: if kind.is_empty() { "subagent".to_string() } else { kind },
+                description: subagent_name("", &description),
+                running: false,
+                started_at: started,
+                ended_at: Some(ended),
+                doing: None,
+                tool_calls,
+                result,
+                prompt: None,
+            }
+        })
+        .collect();
+    out.sort_by_key(|s| s.started_at);
+    out
+}
+
+/// (tool calls made, start of the last thing it said) in a transcript.
+fn summarize(path: &Path) -> (u32, Option<String>) {
+    let Ok(file) = File::open(path) else { return (0, None) };
+    let (mut calls, mut last) = (0u32, None);
+    for line in BufReader::new(file).split(b'\n').map_while(Result::ok) {
+        let Ok(line) = std::str::from_utf8(&line) else { continue };
+        if !line.contains("\"assistant\"") {
+            continue;
+        }
+        calls += line.matches("\"type\":\"tool_use\"").count() as u32;
+        if line.contains("\"type\":\"text\"")
+            && let Ok(v) = serde_json::from_str::<Value>(line)
+            && let Some(parts) = v["message"]["content"].as_array()
+            && let Some(text) = parts.iter().filter(|p| p["type"] == "text").filter_map(|p| p["text"].as_str()).next_back()
+            && !text.trim().is_empty()
+        {
+            last = Some(shorten(text, 300));
+        }
     }
-    all.into_iter().collect()
+    (calls, last)
 }
 
 /// Per transcript: how far it was read, and the files found so far.
@@ -399,6 +483,44 @@ mod tests {
         got = edits_in(&t, &cwd).into_iter().collect();
         got.sort();
         assert_eq!(got, [cwd.join("n.ipynb"), cwd.join("src/a.rs")]);
+    }
+
+    #[test]
+    fn knows_which_agent_edited_what_and_rebuilds_subagents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let cwd = root.join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        // SAFETY: the only test that reads `CLAUDE_CONFIG_DIR`.
+        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", root.join("claude")) };
+        let dir = root.join("claude/projects").join(encode(&cwd));
+        let subs = dir.join("s1/subagents");
+        std::fs::create_dir_all(&subs).unwrap();
+        let write = |file: &str| {
+            serde_json::json!({ "type": "assistant", "message": { "content": [
+                { "type": "text", "text": format!("Done with {file}") },
+                { "type": "tool_use", "name": "Write", "input": { "file_path": file } },
+            ] } })
+            .to_string()
+                + "\n"
+        };
+        std::fs::write(dir.join("s1.jsonl"), write("a.rs") + &write("both.rs")).unwrap();
+        std::fs::write(subs.join("agent-x1.jsonl"), write("b.rs") + &write("both.rs")).unwrap();
+        std::fs::write(subs.join("agent-x1.meta.json"), r#"{"agentType":"Explore","description":"Write the tests"}"#).unwrap();
+
+        let edits = edits(&cwd, "s1");
+        let names = |f: &str| edits[&cwd.join(f)].iter().map(|e| e.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names("a.rs"), ["main"]);
+        assert_eq!(names("b.rs"), ["Write the tests"]);
+        assert_eq!(names("both.rs"), ["main", "Write the tests"]);
+        assert_eq!(edits[&cwd.join("b.rs")][0].agent, "x1");
+
+        let subagents = subagents(&cwd, "s1");
+        assert_eq!(subagents.len(), 1);
+        assert_eq!((subagents[0].kind.as_str(), subagents[0].description.as_str()), ("Explore", "Write the tests"));
+        assert_eq!(subagents[0].tool_calls, 2);
+        assert_eq!(subagents[0].result.as_deref(), Some("Done with both.rs"));
+        assert!(!subagents[0].running);
     }
 
     #[test]

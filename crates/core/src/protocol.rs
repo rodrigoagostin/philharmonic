@@ -208,6 +208,19 @@ pub struct FileChange {
     pub path: String,
     pub added: u32,
     pub removed: u32,
+    /// Who edited it, from the conversation: the main agent and/or subagents. Empty when
+    /// unknown (changed by a shell command, by you, or before the task's conversation).
+    #[serde(default)]
+    pub by: Vec<Editor>,
+}
+
+/// An agent that edited a file.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Editor {
+    /// Claude Code's `agent_id`; empty for the task's main agent.
+    pub agent: String,
+    /// "main", or what the subagent was asked to do.
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -13,7 +13,7 @@ pub mod task;
 
 pub use activity::{Activity, ActivityKind, PlanItem, Subagent, Usage};
 pub use context::{Collection, CollectionId, ContextId, ContextItem, ContextKind, Scope};
-pub use protocol::{Event, FileChange, FoundSession, Request, Response, ShipMethod};
+pub use protocol::{Editor, Event, FileChange, FoundSession, Request, Response, ShipMethod};
 pub use task::{Agent, Task, TaskId, TaskStatus};
 
 /// Seconds since 1970 (for `created_at` fields).

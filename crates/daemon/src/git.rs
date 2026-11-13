@@ -268,7 +268,7 @@ pub async fn diff(
             let added = parts.next()?.parse().unwrap_or(0);
             let removed = parts.next()?.parse().unwrap_or(0);
             let path = parts.next()?.to_string();
-            Some(FileChange { path, added, removed })
+            Some(FileChange { path, added, removed, by: Vec::new() })
         })
         .collect();
     Ok((files, patch))

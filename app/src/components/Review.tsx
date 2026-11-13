@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, type FileChange, type Task, type TaskStatus } from "../api";
 import { useStore } from "../store";
+import { EditedByLabel, EditorFilter, editedBy, type EditorPick } from "./Editors";
 import { Icon, StatusPill } from "./ui";
 
 const LIVE: TaskStatus[] = ["queued", "running", "needs_input", "review"];
@@ -140,7 +141,11 @@ export function Review({ task }: { task: Task }) {
     }
   }
 
-  const shown = active ? diffs.filter((d) => d.path === active) : diffs;
+  const [editor, setEditor] = useState<EditorPick>(null);
+  const withSubagents = files.some((f) => f.by.some((e) => e.agent !== ""));
+  const pickedFiles = files.filter((f) => editedBy(f, editor));
+  const picked = new Set(pickedFiles.map((f) => f.path));
+  const shown = active ? diffs.filter((d) => d.path === active) : diffs.filter((d) => editor === null || picked.has(d.path));
 
   return (
     <section className="review">
@@ -186,9 +191,20 @@ export function Review({ task }: { task: Task }) {
           <button className={`file-btn${active === null ? " active" : ""}`} onClick={() => setActive(null)}>
             All files
           </button>
-          {files.map((f) => (
+          <EditorFilter
+            files={files}
+            pick={editor}
+            onPick={(p) => {
+              setEditor(p);
+              setActive(null);
+            }}
+          />
+          {pickedFiles.map((f) => (
             <button key={f.path} className={`file-btn${active === f.path ? " active" : ""}`} onClick={() => setActive(f.path)}>
-              <span className="ellipsis grow mono small">{f.path}</span>
+              <span className="grow file-name">
+                <span className="ellipsis mono small">{f.path}</span>
+                <EditedByLabel by={f.by} show={withSubagents} />
+              </span>
               <span className="add small">+{f.added}</span>
               <span className="del small">−{f.removed}</span>
             </button>

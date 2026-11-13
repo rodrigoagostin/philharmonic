@@ -1,6 +1,7 @@
 import { useRef, useState } from "react";
 import { api, repoName, type Task, type TaskStatus } from "../api";
 import { useChangedFiles } from "../hooks";
+import { EditedByLabel, EditorFilter, editedBy, type EditorPick } from "./Editors";
 import { useStore } from "../store";
 import { ActivityPanel } from "./Activity";
 import { PromptsPanel } from "./Prompts";
@@ -15,6 +16,9 @@ export function Focus({ task }: { task: Task }) {
   const s = useStore();
   const live = LIVE.includes(task.status);
   const files = useChangedFiles(task.id);
+  // Which agent's files (main / a subagent); labels only matter once subagents edited something.
+  const [editor, setEditor] = useState<EditorPick>(null);
+  const withSubagents = files.some((f) => f.by.some((e) => e.agent !== ""));
   const [confirmDiscard, setConfirmDiscard] = useState(false);
   const term = useRef<TermControl | null>(null);
   const tabs = s.tasks.filter((t) => t.status !== "done");
@@ -117,13 +121,19 @@ export function Focus({ task }: { task: Task }) {
             {files.length === 0 && (
               <p className="muted small">{task.adopted && !task.base ? "Not a git repository: nothing to compare." : "No changes yet."}</p>
             )}
-            {files.map((f) => (
-              <div key={f.path} className="file-row">
-                <span className="ellipsis grow mono small">{f.path}</span>
-                <span className="add small">+{f.added}</span>
-                <span className="del small">−{f.removed}</span>
-              </div>
-            ))}
+            <EditorFilter files={files} pick={editor} onPick={setEditor} />
+            {files
+              .filter((f) => editedBy(f, editor))
+              .map((f) => (
+                <div key={f.path} className="file-row">
+                  <span className="grow file-name">
+                    <span className="ellipsis mono small">{f.path}</span>
+                    <EditedByLabel by={f.by} show={withSubagents} />
+                  </span>
+                  <span className="add small">+{f.added}</span>
+                  <span className="del small">−{f.removed}</span>
+                </div>
+              ))}
             <button className="link-btn small" onClick={() => s.go({ name: "review", id: task.id })}>
               Review diff →
             </button>

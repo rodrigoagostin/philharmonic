@@ -115,6 +115,17 @@ export interface FileChange {
   path: string;
   added: number;
   removed: number;
+  /** Agents that edited it (from the conversation); empty = unknown. */
+  by: Editor[];
+}
+
+/** An older daemon doesn't say who edited what. */
+const withEditors = (files: FileChange[]) => files.map((f) => ({ ...f, by: f.by ?? [] }));
+
+/** An agent that edited a file: `agent` is "" for the main agent, else the subagent's id. */
+export interface Editor {
+  agent: string;
+  name: string;
 }
 
 export type DaemonEvent =
@@ -186,8 +197,12 @@ export const api = {
   /** Just the visible text: cheap enough to poll, for previews. */
   screenText: async (id: number) => (await request<{ text: string }>({ type: "screen_text", id })).text,
   send: (id: number, text: string, context: number[] = []) => request({ type: "send", id, text, context }),
-  diff: (id: number) => request<{ files: FileChange[]; patch: string }>({ type: "diff", id }),
-  changedFiles: async (id: number) => (await request<{ files: FileChange[] }>({ type: "diff", id, patch: false })).files,
+  diff: async (id: number) => {
+    const r = await request<{ files: FileChange[]; patch: string }>({ type: "diff", id });
+    return { ...r, files: withEditors(r.files) };
+  },
+  changedFiles: async (id: number) =>
+    withEditors((await request<{ files: FileChange[] }>({ type: "diff", id, patch: false })).files),
   ship: async (id: number, how: "pr" | "merge") =>
     (await request<{ message: string }>({ type: "ship", id, how })).message,
   listContext: async () => (await request<{ items: ContextItem[] }>({ type: "list_context" })).items,

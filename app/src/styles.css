@@ -1599,3 +1599,38 @@ textarea {
 .term-project {
   max-width: 160px;
 }
+
+/* ---- who edited which file (main agent / subagents) ---- */
+.editor-filter {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 4px 0 6px;
+}
+.editor-chip {
+  display: inline-flex;
+  gap: 4px;
+  max-width: 100%;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--panel);
+  font-size: 11px;
+  cursor: pointer;
+}
+.editor-chip:hover {
+  background: var(--panel-2);
+}
+.editor-chip.active {
+  background: var(--border-soft);
+  border-color: var(--muted);
+}
+.file-name {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.edited-by {
+  font-size: 10.5px;
+  color: var(--muted);
+}

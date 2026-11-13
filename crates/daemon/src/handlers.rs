@@ -174,18 +174,25 @@ async fn dispatch(request: Request, d: &Shared) -> Result<Response> {
             if task.base.is_empty() {
                 Response::Diff { files: Vec::new(), patch: String::new() }
             } else {
+                // Who edited what, from the conversation (main agent and subagents).
+                let edits = match task.session.clone() {
+                    Some(s) => {
+                        let cwd = task.worktree.clone();
+                        tokio::task::spawn_blocking(move || sessions::edits(&cwd, &s)).await?
+                    }
+                    None => Default::default(),
+                };
                 // A thread working in your own folder shares it with you and other threads:
                 // show only the files this conversation edited.
-                let only = if task.adopted {
-                    let (cwd, session) = (task.worktree.clone(), task.session.clone());
-                    Some(match session {
-                        Some(s) => tokio::task::spawn_blocking(move || sessions::touched_files(&cwd, &s)).await?,
-                        None => Vec::new(), // hasn't started a conversation yet
-                    })
-                } else {
-                    None
-                };
-                let (files, patch) = git::diff(&task.worktree, &task.base, patch, only.as_deref()).await?;
+                let only: Option<Vec<PathBuf>> = task.adopted.then(|| edits.keys().cloned().collect());
+                let (mut files, patch) = git::diff(&task.worktree, &task.base, patch, only.as_deref()).await?;
+                if !edits.is_empty() {
+                    // numstat paths are relative to the repo's top folder.
+                    let top = git::toplevel(&task.worktree).await?;
+                    for f in &mut files {
+                        f.by = edits.get(&top.join(&f.path)).cloned().unwrap_or_default();
+                    }
+                }
                 Response::Diff { files, patch }
             }
         }
@@ -572,6 +579,14 @@ async fn import(d: &Shared, repo: &std::path::Path, ids: &[String]) -> Result<Ve
     let (main, base) = home_of(repo).await?;
     // Like a new task there: it uses the collections linked to the repo.
     let collections = context_store::linked_to(d, &main);
+    // Their subagents ran outside Philharmonic (no hook reported them): read them from disk.
+    let wanted: Vec<(String, PathBuf)> =
+        found.iter().filter(|f| ids.contains(&f.id)).map(|f| (f.id.clone(), f.cwd.clone())).collect();
+    let subagents: std::collections::HashMap<String, Vec<philharmonic_core::Subagent>> =
+        tokio::task::spawn_blocking(move || {
+            wanted.into_iter().map(|(id, cwd)| { let list = sessions::subagents(&cwd, &id); (id, list) }).collect()
+        })
+        .await?;
 
     let mut created = Vec::new();
     for id in ids {
@@ -600,7 +615,7 @@ async fn import(d: &Shared, repo: &std::path::Path, ids: &[String]) -> Result<Ve
                 collections: collections.clone(),
                 doing: None,
                 plan: Vec::new(),
-                subagents: Vec::new(),
+                subagents: subagents.get(&f.id).cloned().unwrap_or_default(),
                 usage: Usage::default(),
                 tool_calls: 0,
                 summary: None,
