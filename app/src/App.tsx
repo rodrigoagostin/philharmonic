@@ -3,6 +3,7 @@ import { useStore } from "./store";
 import { TopBar } from "./components/TopBar";
 import { Sidebar } from "./components/Sidebar";
 import { Stage } from "./components/Stage";
+import { Overview } from "./components/Overview";
 import { Focus } from "./components/Focus";
 import { Review } from "./components/Review";
 import { ContextShelf } from "./components/ContextShelf";
@@ -25,6 +26,9 @@ export function App() {
         e.preventDefault();
         s.go({ name: "stage" });
         setTimeout(() => document.getElementById("search")?.focus(), 0);
+      } else if (e.metaKey && e.key.toLowerCase() === "j") {
+        e.preventDefault();
+        s.go({ name: "stage" });
       } else if (e.metaKey && /^[1-9]$/.test(e.key)) {
         const live = s.tasks.filter((t) => t.status !== "done");
         const task = live[Number(e.key) - 1];
@@ -34,9 +38,9 @@ export function App() {
         }
       } else if (e.metaKey && e.key === "0") {
         e.preventDefault();
-        s.go({ name: "stage" });
-      } else if (e.key === "Escape" && !inTerminal && !s.newTaskOpen && !s.importOpen && s.view.name !== "stage") {
-        s.go({ name: "stage" });
+        s.go({ name: "overview" });
+      } else if (e.key === "Escape" && !inTerminal && !s.newTaskOpen && !s.importOpen && s.view.name !== "overview") {
+        s.go({ name: "overview" });
       }
     }
     window.addEventListener("keydown", onKey);
@@ -47,25 +51,43 @@ export function App() {
   const viewTaskId = s.view.name === "focus" || s.view.name === "review" ? s.view.id : undefined;
   const missing = viewTaskId !== undefined && !s.task(viewTaskId) && s.connected;
   useEffect(() => {
-    if (missing) s.go({ name: "stage" });
+    if (missing) s.go({ name: "overview" });
   }, [missing, s]);
 
   return (
     <div className="app">
       <TopBar />
+      {s.daemonOutdated && (
+        <div className="update-banner" role="status">
+          <span>
+            <strong>Philharmonic was updated.</strong> Its background service is still running the old version. Restart
+            it to use the new one: running agents are stopped and resumed, and keep their conversations.
+          </span>
+          <button className="btn btn-primary" onClick={s.restartDaemon} disabled={s.restarting}>
+            {s.restarting ? "Restarting…" : "Restart service"}
+          </button>
+        </div>
+      )}
       <div className="body">
         <Sidebar />
         <main className="main">
+          {s.view.name === "overview" && <Overview />}
           {s.view.name === "stage" && <Stage />}
           {/* `key`: a fresh Focus per task, so drafts, attachments and panels never carry over. */}
           {s.view.name === "focus" && s.task(s.view.id) && <Focus key={s.view.id} task={s.task(s.view.id)!} />}
           {s.view.name === "review" && s.task(s.view.id) && <Review task={s.task(s.view.id)!} />}
-          {s.view.name === "context" && <ContextShelf taskId={s.view.taskId} />}
+          {s.view.name === "context" && (
+            <ContextShelf
+              key={`${s.view.taskId}-${s.view.collectionId}`}
+              taskId={s.view.taskId}
+              collectionId={s.view.collectionId}
+            />
+          )}
         </main>
       </div>
       <StatusBar />
       {s.newTaskOpen && <NewTaskModal />}
-      {s.importOpen && <ImportModal initialRepo={s.repoFilter ?? undefined} />}
+      {s.importOpen && <ImportModal initialRepo={s.filter?.kind === "repo" ? s.filter.repo : undefined} />}
       <Toasts />
     </div>
   );

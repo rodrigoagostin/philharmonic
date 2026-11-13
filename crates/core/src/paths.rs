@@ -33,6 +33,11 @@ pub fn context_dir() -> Result<PathBuf> {
     Ok(data_dir()?.join("ctx"))
 }
 
+/// Activity logs, one JSON-lines file per task: `<data_dir>/activity/<id>.jsonl`.
+pub fn activity_dir() -> Result<PathBuf> {
+    Ok(data_dir()?.join("activity"))
+}
+
 /// Tasks and context items, saved after every change.
 pub fn state_file() -> Result<PathBuf> {
     Ok(data_dir()?.join("state.json"))

@@ -3,6 +3,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::activity::{PlanItem, Subagent, Usage};
+
 /// Tasks get small, human-friendly numbers (`ph send 3 "..."`) instead of UUIDs.
 pub type TaskId = u64;
 
@@ -46,6 +48,31 @@ pub struct Task {
     /// Philharmonic's, so discarding the task only forgets it (nothing is deleted).
     #[serde(default)]
     pub adopted: bool,
+    /// Collections whose context this task uses (see `context::Collection`).
+    #[serde(default)]
+    pub collections: Vec<crate::context::CollectionId>,
+
+    // ---- live details, reported by Claude Code hooks ----
+    /// What the main agent is doing right now, e.g. "Editing src/main.rs".
+    #[serde(default)]
+    pub doing: Option<String>,
+    /// The agent's own todo list.
+    #[serde(default)]
+    pub plan: Vec<PlanItem>,
+    /// Helper agents it launched.
+    #[serde(default)]
+    pub subagents: Vec<Subagent>,
+    #[serde(default)]
+    pub usage: Usage,
+    /// Tool calls made (main agent + subagents).
+    #[serde(default)]
+    pub tool_calls: u32,
+    /// Start of the agent's last final message: what it says it did.
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// Unix seconds of the last thing it did.
+    #[serde(default)]
+    pub last_activity: u64,
 }
 
 fn yes() -> bool {

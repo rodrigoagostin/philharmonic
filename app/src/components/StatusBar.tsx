@@ -10,7 +10,7 @@ export function StatusBar() {
       <span>{count("review")} in review</span>
       <span>{count("done")} done</span>
       <span className="spacer" />
-      <span className="muted">⌘N new · ⌘K search · ⌘1–9 tasks · ⌘0 stage</span>
+      <span className="muted">⌘N new · ⌘0 overview · ⌘J stage · ⌘K search · ⌘1–9 tasks</span>
       {s.connected ? (
         <span className="ok">● Daemon connected</span>
       ) : (

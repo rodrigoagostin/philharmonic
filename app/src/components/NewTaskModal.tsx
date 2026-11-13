@@ -1,33 +1,67 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { api, repoName, type ContextItem } from "../api";
+import { useDraft } from "../hooks";
 import { recentRepos, rememberRepo, useStore } from "../store";
 import { ContextChip } from "./ContextShelf";
 import { contextFromDrop, contextFromPaste, Icon, type NewContext } from "./ui";
+
+/** A ticket key in the prompt, like ABC-123 (Jira, Linear…). */
+const TICKET = /\b([A-Z][A-Z0-9]+-\d+)\b/;
+
+function slug(text: string, max: number): string {
+  return text.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, max).replace(/-+$/, "");
+}
+
+/** The part before the last `/` of the branch you used last time in this repo (e.g. `feature/`). */
+const prefixKey = (repo: string) => `ph.branchPrefix:${repo}`;
+function lastPrefix(repo: string): string {
+  try {
+    return localStorage.getItem(prefixKey(repo)) ?? "";
+  } catch {
+    return "";
+  }
+}
+function rememberPrefix(repo: string, branch: string) {
+  try {
+    localStorage.setItem(prefixKey(repo), branch.includes("/") ? branch.slice(0, branch.lastIndexOf("/") + 1) : "");
+  } catch {
+    /* not important */
+  }
+}
+
+/** `feature/ABC-123-fix-login` from "ABC-123 fix login", or "" when there's no ticket. */
+export function suggestBranch(prompt: string, prefix: string): string {
+  const m = prompt.match(TICKET);
+  if (!m) return "";
+  const rest = slug(prompt.split("\n")[0].replace(m[1], " "), 40);
+  return `${prefix}${m[1]}${rest ? `-${rest}` : ""}`;
+}
 
 const MODELS = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-2"];
 
 export function NewTaskModal() {
   const s = useStore();
   const repos = [...new Set([...recentRepos(), ...s.tasks.map((t) => t.repo)])];
-  const [prompt, setPrompt] = useState("");
+  const [prompt, setPrompt, files] = useDraft("new-task");
   const [repo, setRepo] = useState(repos[0] ?? "");
   const [branches, setBranches] = useState<string[]>([]);
   const [base, setBase] = useState("");
   // A new project (not a git repo yet, or no commits): the daemon sets git up on Start.
   const [fresh, setFresh] = useState(false);
+  const [typedBranch, setTypedBranch] = useState<string | null>(null);
+  const branch = typedBranch ?? suggestBranch(prompt, lastPrefix(repo));
   const [agent, setAgent] = useState<"claude" | "custom">("claude");
   const [model, setModel] = useState("");
   const [command, setCommand] = useState("");
   const [autoApprove, setAutoApprove] = useState(false);
-  const [attached, setAttached] = useState<number[]>([]);
+  const attached = files.ids;
   const [picking, setPicking] = useState(false);
   const [busy, setBusy] = useState(false);
   const close = () => s.setNewTaskOpen(false);
-  // Files pasted or dropped here go to the inbox right away. If you cancel, they go too.
-  const uploaded = useRef<number[]>([]);
+  // Closing without starting: files pasted here are deleted, so they don't pile up on the shelf.
   const cancel = () => {
-    uploaded.current.forEach((id) => api.removeContext(id).catch(() => {}));
+    files.discard();
     close();
   };
 
@@ -63,17 +97,27 @@ export function NewTaskModal() {
 
   const byId = new Map(s.context.map((c) => [c.id, c]));
   const items = attached.map((id) => byId.get(id)).filter(Boolean) as ContextItem[];
+  // Collections: the ones linked to the repo, unless you changed the selection.
+  const [pickedCollections, setPickedCollections] = useState<number[] | null>(null);
+  useEffect(() => setPickedCollections(null), [repo]);
+  const linked = s.collections.filter((c) => c.repos.includes(repo)).map((c) => c.id);
+  const collections = (pickedCollections ?? linked).filter((id) => s.collection(id));
+  const otherCollections = s.collections.filter((c) => !collections.includes(c.id));
+
+  async function newCollectionForRepo() {
+    const c = await s.run(() => api.saveCollection({ name: repoName(repo), repos: [repo] }));
+    if (c) setPickedCollections([...collections, c.id]);
+  }
+
+  // Items you can single out in the first prompt: from the chosen collections.
   const pickable = s.context.filter(
-    (c) => !attached.includes(c.id) && (c.scope.kind === "inbox" || (c.scope.kind === "project" && c.scope.repo === repo)),
+    (c) => !attached.includes(c.id) && c.scope.kind === "collection" && collections.includes(c.scope.id),
   );
 
   async function add(list: NewContext[]) {
     for (const c of list) {
-      const item = await s.run(() => api.addContext({ scope: { kind: "inbox" }, ...c }));
-      if (item) {
-        uploaded.current.push(item.id);
-        setAttached((a) => [...a, item.id]);
-      }
+      const item = await s.run(() => api.addContext({ scope: { kind: "draft" }, ...c }));
+      if (item) files.uploaded(item.id);
     }
   }
 
@@ -92,15 +136,19 @@ export function NewTaskModal() {
         prompt: prompt.trim(),
         repo,
         base,
+        branch: branch.trim() || null,
         agent: agent === "claude" ? { kind: "claude" } : { kind: "custom", command: command.trim() },
         model: agent === "claude" && model.trim() ? model.trim() : null,
         auto_approve: agent === "claude" && autoApprove,
         context: attached,
+        collections,
       }),
     );
     setBusy(false);
     if (task) {
+      files.sent(); // they now belong to the task
       rememberRepo(repo);
+      if (branch.trim()) rememberPrefix(repo, branch.trim());
       close();
       s.go({ name: "focus", id: task.id });
     }
@@ -148,28 +196,66 @@ export function NewTaskModal() {
             add(await contextFromDrop(e));
           }}
         >
-          <span className="small muted">Context</span>
+          <span className="small muted">Collections</span>
+          <div className="chips">
+            {collections.map((id) => (
+              <span key={id} className="chip chip-collection" title="The agent gets this collection's docs, screenshots, links and notes">
+                <Icon name="clipboard" size={14} />
+                <span className="ellipsis">{s.collection(id)?.name}</span>
+                <span
+                  role="button"
+                  tabIndex={0}
+                  aria-label={`Don't use ${s.collection(id)?.name}`}
+                  className="chip-x"
+                  onClick={() => setPickedCollections(collections.filter((x) => x !== id))}
+                >
+                  <Icon name="close" size={12} />
+                </span>
+              </span>
+            ))}
+            {otherCollections.length > 0 && (
+              <select
+                aria-label="Add a collection"
+                value=""
+                onChange={(e) => e.target.value && setPickedCollections([...collections, Number(e.target.value)])}
+              >
+                <option value="">+ Add a collection…</option>
+                {otherCollections.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name}
+                  </option>
+                ))}
+              </select>
+            )}
+            {repo && linked.length === 0 && (
+              <button className="link-btn small" onClick={newCollectionForRepo}>
+                + New collection “{repoName(repo)}”
+              </button>
+            )}
+          </div>
+          <span className="small muted">Attached to this task</span>
           <div className="chips">
             {items.length === 0 && <span className="small muted">Drop files here or paste into the prompt.</span>}
             {items.map((c) => (
-              <ContextChip key={c.id} item={c} onRemove={() => setAttached((a) => a.filter((x) => x !== c.id))} />
+              <ContextChip key={c.id} item={c} onRemove={() => files.remove(c.id)} />
             ))}
           </div>
           <button className="link-btn small" onClick={() => setPicking((p) => !p)} disabled={!pickable.length}>
-            From shelf… ({pickable.length})
+            Point at an item… ({pickable.length})
           </button>
-          {picking && (
+          {picking && pickable.length > 0 && (
             <div className="picker">
               {pickable.map((c) => (
                 <button
                   key={c.id}
                   className="picker-row"
                   onClick={() => {
-                    setAttached((a) => [...a, c.id]);
+                    files.pick(c.id);
                     setPicking(false);
                   }}
                 >
-                  <ContextChip item={c} />
+                  {/* ✕ deletes it from its collection (attaching is the row itself). */}
+              <ContextChip item={c} onRemove={() => s.run(() => api.removeContext(c.id))} />
                 </button>
               ))}
             </div>
@@ -232,13 +318,24 @@ export function NewTaskModal() {
 
         <fieldset className="iso">
           <legend>Isolation</legend>
+          <label className="field">
+            <span>New branch</span>
+            <input
+              className="mono"
+              value={branch}
+              placeholder={`ph/${slug(prompt.split("\n")[0], 40) || "…"}`}
+              onChange={(e) => setTypedBranch(e.target.value)}
+              spellCheck={false}
+            />
+          </label>
           <p className="small muted">
             {fresh ? (
               "New project, nothing to set up: the agent gets its own copy of the folder to work in, and you review what it made before it lands here."
             ) : (
               <>
-                The agent works in its own git worktree on a new branch <code>ph/…</code> off{" "}
-                <code>{base || "the base branch"}</code>. Your checkout is never touched.
+                The agent works in its own git worktree on this branch, off <code>{base || "the base branch"}</code>. Your
+                checkout is never touched. A ticket key in the prompt (like <code>ABC-123</code>) goes into the name; leave it
+                empty for <code>ph/…</code>.
               </>
             )}
           </p>

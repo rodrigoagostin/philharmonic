@@ -4,7 +4,7 @@ import { Dot } from "./ui";
 
 export function Sidebar() {
   const s = useStore();
-  const tasks = s.tasks.filter((t) => !s.repoFilter || t.repo === s.repoFilter);
+  const tasks = s.tasks.filter(s.shown);
   const activeId = s.view.name === "focus" || s.view.name === "review" ? s.view.id : undefined;
 
   return (

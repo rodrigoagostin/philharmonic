@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use philharmonic_core::{Agent, HookEvent, Request, Response, ShipMethod, Task, TaskId};
+use philharmonic_core::{Activity, Agent, Collection, Request, Response, ShipMethod, Task, TaskId};
 
 /// Run and steer many coding agents in parallel.
 #[derive(Parser)]
@@ -23,6 +23,8 @@ struct Cli {
 enum Command {
     /// Check that the daemon is running.
     Ping,
+    /// Stop the daemon and its agents (the app starts a new one; resume tasks after).
+    Shutdown,
     /// Start a new task: a worktree + branch, with an agent working on the prompt.
     New {
         /// What the agent should do.
@@ -33,6 +35,9 @@ enum Command {
         /// Branch to start from.
         #[arg(long, default_value = "main")]
         base: String,
+        /// Name of the new branch (default: ph/<from the prompt>), e.g. feature/ABC-123-login.
+        #[arg(long)]
+        branch: Option<String>,
         /// Model for Claude Code (e.g. claude-opus-5-5).
         #[arg(long)]
         model: Option<String>,
@@ -42,7 +47,13 @@ enum Command {
         /// Run this shell command instead of Claude Code (the prompt is in $PH_PROMPT).
         #[arg(long)]
         cmd: Option<String>,
+        /// Use this collection's context (repeat for several). Default: the collections
+        /// linked to the repo.
+        #[arg(short = 'c', long = "collection")]
+        collections: Vec<String>,
     },
+    /// List the context collections.
+    Collections,
     /// List all tasks.
     Ls,
     /// Print what's on a task's terminal right now.
@@ -75,11 +86,18 @@ enum Command {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
     },
-    /// Used by Claude Code hooks to report status. Reads the hook's JSON on stdin.
+    /// What a task's agent did (or every agent's latest actions, without an id).
+    Log {
+        id: Option<TaskId>,
+        /// How many lines.
+        #[arg(short = 'n', long, default_value_t = 40)]
+        lines: usize,
+    },
+    /// Used by Claude Code hooks: forwards the hook's JSON (stdin) to the daemon.
     #[command(hide = true)]
     Notify {
-        #[arg(value_enum)]
-        event: Hook,
+        /// Ignored (older hook settings passed an event name).
+        _event: Option<String>,
     },
 }
 
@@ -89,40 +107,37 @@ enum How {
     Merge,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
-enum Hook {
-    Running,
-    NeedsInput,
-    Stopped,
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Hooks must never break the agent: report quietly and always exit 0.
-    if let Command::Notify { event } = cli.command {
-        let _ = notify(event).await;
+    if let Command::Notify { .. } = cli.command {
+        let _ = notify().await;
         return Ok(());
     }
 
     let request = match cli.command {
         Command::Ping => Request::Ping,
-        Command::New { prompt, repo, base, model, auto_approve, cmd } => {
+        Command::Shutdown => Request::Shutdown,
+        Command::New { prompt, repo, base, branch, model, auto_approve, cmd, collections } => {
             // The daemon runs in a different folder than you, so send an absolute path.
             let repo = repo.canonicalize().with_context(|| format!("repo not found: {}", repo.display()))?;
             let agent = match cmd {
                 Some(command) => Agent::Custom { command },
                 None => Agent::Claude,
             };
-            Request::NewTask { prompt, repo, base, agent, model, auto_approve, context: vec![] }
+            let collections = if collections.is_empty() { None } else { Some(collection_ids(&collections).await?) };
+            Request::NewTask { prompt, repo, base, branch, agent, model, auto_approve, context: vec![], collections }
         }
+        Command::Collections => Request::ListCollections,
         Command::Ls => Request::ListTasks,
         Command::Show { id } => Request::ScreenText { id },
         Command::Send { id, text } => Request::Send { id, text, context: vec![] },
         Command::Stop { id } => Request::Stop { id },
         Command::Resume { id } => Request::Resume { id },
-        Command::Diff { id } => Request::Diff { id },
+        Command::Diff { id } => Request::Diff { id, patch: true },
         Command::Ship { id, how } => Request::Ship {
             id,
             how: match how {
@@ -148,11 +163,12 @@ async fn main() -> Result<()> {
             };
             Request::Import { repo, sessions }
         }
+        Command::Log { id, lines } => Request::Activity { id, limit: lines },
         Command::Notify { .. } => unreachable!("handled above"),
     };
 
     match client::send(&request).await? {
-        Response::Pong { version } => println!("daemon is up (v{version})"),
+        Response::Pong { version, pid, .. } => println!("daemon is up (v{version}, pid {pid})"),
         Response::Ok => println!("ok"),
         Response::TaskCreated { task } => {
             println!("created task {} on branch {}", task.id, task.branch);
@@ -164,6 +180,8 @@ async fn main() -> Result<()> {
         Response::Diff { patch, .. } => print!("{patch}"),
         Response::Shipped { message } => println!("{message}"),
         Response::Discovered { sessions } => print_threads(&sessions),
+        Response::Activity { items } => print_activity(&items),
+        Response::Collections { collections } => print_collections(&collections),
         Response::Error { message } => bail!("daemon: {message}"),
         other => println!("{other:?}"),
     }
@@ -213,21 +231,56 @@ fn print_threads(sessions: &[philharmonic_core::FoundSession]) {
     }
 }
 
-/// Called by Claude Code hooks inside a task's terminal: `$PH_TASK_ID` says which task.
-async fn notify(event: Hook) -> Result<()> {
-    let id: TaskId = std::env::var("PH_TASK_ID")?.parse()?;
-    // Hooks get a JSON object on stdin; `message` explains Notification events.
-    let mut input = String::new();
-    let _ = std::io::stdin().read_to_string(&mut input);
-    let json = serde_json::from_str::<serde_json::Value>(&input).unwrap_or_default();
-    let text = |key: &str| json.get(key).and_then(|v| v.as_str()).map(str::to_string);
-    let message = text("message").unwrap_or_default();
-    let session_id = text("session_id");
-    let event = match event {
-        Hook::Running => HookEvent::Running,
-        Hook::NeedsInput => HookEvent::NeedsInput,
-        Hook::Stopped => HookEvent::Stopped,
+/// Collection names (any case) to ids.
+async fn collection_ids(names: &[String]) -> Result<Vec<u64>> {
+    let Response::Collections { collections } = client::send(&Request::ListCollections).await? else {
+        bail!("the daemon didn't list its collections");
     };
-    client::send(&Request::Notify { id, event, message, session_id }).await?;
+    names
+        .iter()
+        .map(|name| {
+            collections
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(name.trim()))
+                .map(|c| c.id)
+                .with_context(|| format!("no collection called \"{name}\" (see `ph collections`)"))
+        })
+        .collect()
+}
+
+fn print_collections(collections: &[Collection]) {
+    if collections.is_empty() {
+        println!("no collections yet (make them in the app's Context screen)");
+        return;
+    }
+    let width = collections.iter().map(|c| c.name.len()).max().unwrap_or(0).max("NAME".len());
+    println!("{:<4}{:<width$}  LINKED REPOS", "ID", "NAME");
+    for c in collections {
+        let repos: Vec<String> = c.repos.iter().map(|r| r.display().to_string()).collect();
+        println!("{:<4}{:<width$}  {}", c.id, c.name, if repos.is_empty() { "-".into() } else { repos.join(", ") });
+    }
+}
+
+/// Called by Claude Code hooks inside a task's terminal: `$PH_TASK_ID` says which task.
+async fn notify() -> Result<()> {
+    let id: TaskId = std::env::var("PH_TASK_ID")?.parse()?;
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input)?;
+    let payload: serde_json::Value = serde_json::from_str(&input)?;
+    client::send(&Request::Hook { id, payload }).await?;
     Ok(())
+}
+
+/// `14:02  #3  Editing src/main.rs` (subagent actions are indented).
+fn print_activity(items: &[Activity]) {
+    if items.is_empty() {
+        println!("no activity yet");
+        return;
+    }
+    for a in items {
+        let secs = a.at % 86_400;
+        let indent = if a.agent.is_some() { "  ↳ " } else { "" };
+        let text = a.text.lines().next().unwrap_or_default();
+        println!("{:02}:{:02} UTC  #{:<3} {indent}{text}", secs / 3600, secs % 3600 / 60, a.task);
+    }
 }

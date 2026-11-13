@@ -6,15 +6,17 @@ use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use philharmonic_core::{
-    Agent, ContextId, Event, FoundSession, HookEvent, Request, Response, Scope, ShipMethod, Task, TaskId, TaskStatus,
-    now, paths, slug::slugify,
+    ActivityKind, Agent, ContextId, Event, FoundSession, Request, Response, Scope, ShipMethod, Task, TaskId, TaskStatus,
+    Usage, now, paths, slug::slugify,
 };
 
+use crate::activity_log::{self, record};
 use crate::agent::{self, Start};
 use crate::context_store;
 use crate::daemon::Shared;
 use crate::git;
 use crate::sessions;
+use crate::hooks;
 
 pub async fn handle(request: Request, d: &Shared) -> Response {
     match dispatch(request, d).await {
@@ -29,11 +31,24 @@ async fn dispatch(request: Request, d: &Shared) -> Result<Response> {
         Request::Ping => Response::Pong {
             // `env!` reads the version from Cargo.toml at compile time.
             version: env!("CARGO_PKG_VERSION").to_string(),
+            pid: std::process::id(),
+            exe: d.exe.clone(),
+            exe_mtime: d.exe_mtime,
+            exe_hash: d.exe_hash,
         },
+        Request::Shutdown => {
+            // Answer first, then stop: the main loop stops the agents and exits.
+            let d = d.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                d.shutdown.notify_one();
+            });
+            Response::Ok
+        }
 
         // ---- tasks ----
-        Request::NewTask { prompt, repo, base, agent, model, auto_approve, context } => {
-            let task = new_task(d, prompt, repo, base, agent, model, auto_approve, context).await?;
+        Request::NewTask { prompt, repo, base, branch, agent, model, auto_approve, context, collections } => {
+            let task = new_task(d, prompt, repo, base, branch, agent, model, auto_approve, context, collections).await?;
             Response::TaskCreated { task }
         }
         Request::ListTasks => Response::Tasks { tasks: d.state.lock().unwrap().list() },
@@ -49,7 +64,8 @@ async fn dispatch(request: Request, d: &Shared) -> Result<Response> {
             // Claude Code can only `--continue` a conversation that exists. If the first
             // prompt never got through (stopped at the trust question, daemon restarted,
             // first start failed…), give it the prompt again.
-            let start = if task.agent == Agent::Claude && !task.started {
+            let fresh = task.agent == Agent::Claude && !task.started;
+            let start = if fresh {
                 Start::Fresh { prompt: first_prompt(&task.prompt, &task_context(d, id)) }
             } else {
                 Start::Resume
@@ -61,7 +77,21 @@ async fn dispatch(request: Request, d: &Shared) -> Result<Response> {
             {
                 bail!("this conversation is open in another terminal. Quit Claude Code there first, then resume it here");
             }
-            Response::Task { task: start_agent(d, &task, start, task.status)? }
+            start_agent(d, &task, start, task.status)?;
+            record(d, id, None, ActivityKind::Lifecycle, "Resumed");
+            // Claude Code comes back idle at its prompt (`--continue` doesn't start working by
+            // itself), so it's waiting for you; its hooks switch it to Running when you send
+            // something. Other agents don't report, so all we know is that they're running.
+            let idle = matches!(task.agent, Agent::Claude) && !fresh;
+            let task = d
+                .update_task(id, |t| {
+                    t.doing = None;
+                    if idle && t.status == TaskStatus::Running {
+                        t.status = TaskStatus::NeedsInput;
+                    }
+                })
+                .with_context(|| format!("no task {id}"))?;
+            Response::Task { task }
         }
         Request::Discard { id } => {
             let task = existing(d, id)?;
@@ -79,6 +109,7 @@ async fn dispatch(request: Request, d: &Shared) -> Result<Response> {
             context_store::remove_for_task(d, id);
             agent::forget_terminal(d, id);
             d.state.lock().unwrap().remove(id);
+            activity_log::remove(id);
             d.save();
             d.emit(Event::TaskRemoved { id });
             Response::Ok
@@ -100,35 +131,53 @@ async fn dispatch(request: Request, d: &Shared) -> Result<Response> {
             agent::resize(d, id, cols.max(10), rows.max(5))?;
             Response::Ok
         }
-        Request::Screen { id } => {
-            let (history, text, end) = agent::screen(d, id);
-            Response::Screen { history, text, end }
+        Request::Screen { id, history } => {
+            let (history, text, end, cols, rows) = agent::screen(d, id, history);
+            Response::Screen { history, text, end, cols, rows }
         }
         Request::ScreenText { id } => Response::ScreenText { text: agent::screen_text(d, id) },
         Request::Send { id, text, context } => {
             existing(d, id)?;
             let items = context_store::get(d, &context);
-            let message = format!("{}{}", text.trim(), context_store::describe(&items));
+            let mut message = format!("{}{}", text.trim(), context_store::describe(&items));
+            // Collections added to the task since its agent started: tell it about them now.
+            let task = existing(d, id)?;
+            let new = agent::unbriefed(d, id, &task.collections);
+            if let Some((brief, _)) = context_store::brief(d, &new, "\n\n---\nThe user added context to this task:") {
+                message.push_str(&brief);
+            }
             agent::send_message(d, id, &message).await?;
+            agent::mark_briefed(d, id, &new);
+            if existing(d, id)?.agent != Agent::Claude {
+                // Claude Code logs it through its UserPromptSubmit hook.
+                record(d, id, None, ActivityKind::Prompt, hooks::shorten(&message, 300));
+            }
             Response::Ok
         }
 
         // ---- hooks ----
-        Request::Notify { id, event, message, session_id } => {
-            on_hook(d, id, event, &message, session_id);
+        Request::Hook { id, payload } => {
+            hooks::on_hook(d, id, &payload);
             Response::Ok
         }
+        Request::Activity { id, limit } => Response::Activity {
+            items: match id {
+                Some(id) => activity_log::for_task(id, limit),
+                None => activity_log::recent(d, limit),
+            },
+        },
 
         // ---- review & ship ----
-        Request::Diff { id } => {
+        Request::Diff { id, patch } => {
             let task = existing(d, id)?;
-            let (files, patch) = git::diff(&task.worktree, &task.base).await?;
+            let (files, patch) = git::diff(&task.worktree, &task.base, patch).await?;
             Response::Diff { files, patch }
         }
         Request::Ship { id, how } => {
             let task = existing(d, id)?;
             let message = ship(&task, how).await?;
             set_status(d, id, TaskStatus::Done)?;
+            record(d, id, None, ActivityKind::Lifecycle, message.clone());
             agent::kill(d, id);
             Response::Shipped { message }
         }
@@ -151,6 +200,21 @@ async fn dispatch(request: Request, d: &Shared) -> Result<Response> {
         Request::Discover { repo } => Response::Discovered { sessions: discover(d, &repo).await? },
         Request::Import { repo, sessions } => Response::Tasks { tasks: import(d, &repo, &sessions).await? },
 
+        // ---- collections ----
+        Request::ListCollections => Response::Collections { collections: context_store::collections(d) },
+        Request::SaveCollection { id, name, repos } => {
+            Response::Collection { collection: context_store::save_collection(d, id, name, repos)? }
+        }
+        Request::DeleteCollection { id } => {
+            context_store::delete_collection(d, id)?;
+            Response::Ok
+        }
+        Request::SetTaskCollections { id, collections } => {
+            existing(d, id)?;
+            let collections = context_store::existing_collections(d, &collections);
+            Response::Task { task: d.update_task(id, |t| t.collections = collections).context("no such task")? }
+        }
+
         // ---- misc ----
         Request::Branches { repo } => Response::Branches { names: git::branches(&repo).await? },
         Request::Subscribe => bail!("subscribe is handled by the connection loop"),
@@ -171,10 +235,12 @@ async fn new_task(
     prompt: String,
     repo: PathBuf,
     base: String,
+    branch: Option<String>,
     agent_kind: Agent,
     model: Option<String>,
     auto_approve: bool,
     context: Vec<ContextId>,
+    collections: Option<Vec<philharmonic_core::CollectionId>>,
 ) -> Result<Task> {
     if prompt.trim().is_empty() {
         bail!("the prompt is empty");
@@ -193,23 +259,53 @@ async fn new_task(
         if names.contains(&base) { base } else { git::current_branch(&repo).await? }
     };
 
-    // Names. If the branch or folder is taken (same prompt twice), try `-2`, `-3`, …
-    let base_slug = slugify(&prompt, 40);
     let repo_dir = paths::worktrees_dir()?.join(git::repo_name(&repo));
-    let mut n = 1;
-    let (branch, dest) = loop {
-        let slug = if n == 1 { base_slug.clone() } else { format!("{base_slug}-{n}") };
-        let branch = format!("ph/{slug}");
-        let dest = repo_dir.join(&slug);
-        if !dest.exists() && !git::branch_exists(&repo, &branch).await? {
-            break (branch, dest); // `break value` makes the loop return that value
+    let (branch, dest) = match branch.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
+        // You named the branch (e.g. with a ticket key): use it exactly, or say why not.
+        Some(name) => {
+            let name = git::check_branch_name(&repo, name).await?;
+            if git::branch_exists(&repo, &name).await? {
+                bail!("the branch {name} already exists");
+            }
+            // The folder is named after the branch: `feature/ABC-123-x` -> `feature-abc-123-x`.
+            let slug = slugify(&name, 60);
+            let mut n = 1;
+            let dest = loop {
+                let dest = repo_dir.join(if n == 1 { slug.clone() } else { format!("{slug}-{n}") });
+                if !dest.exists() {
+                    break dest;
+                }
+                n += 1;
+            };
+            (name, dest)
         }
-        n += 1;
+        // Otherwise `ph/<from the prompt>`. If it's taken (same prompt twice), try `-2`, `-3`, …
+        None => {
+            let base_slug = slugify(&prompt, 40);
+            let mut n = 1;
+            loop {
+                let slug = if n == 1 { base_slug.clone() } else { format!("{base_slug}-{n}") };
+                let branch = format!("ph/{slug}");
+                let dest = repo_dir.join(&slug);
+                if !dest.exists() && !git::branch_exists(&repo, &branch).await? {
+                    break (branch, dest); // `break value` makes the loop return that value
+                }
+                n += 1;
+            }
+        }
     };
 
     // Create the worktree. This `.await`s on git, so it happens BEFORE we lock the state:
     // other clients can keep using the daemon while git runs.
     git::create(&repo, &branch, &base, &dest).await?;
+    // Files git doesn't track (so a worktree doesn't have them) but the agent needs:
+    // your local Claude settings and whatever the repo lists in `.worktreeinclude`.
+    let copied = git::copy_untracked(&repo, &dest).await;
+
+    let chosen = match &collections {
+        Some(ids) => context_store::existing_collections(d, ids),
+        None => context_store::linked_to(d, &repo),
+    };
 
     // Register the task. The lock is held only inside this block.
     let task = {
@@ -230,16 +326,36 @@ async fn new_task(
             started: false,
             session: None,
             adopted: false,
+            collections: chosen,
+            doing: None,
+            plan: Vec::new(),
+            subagents: Vec::new(),
+            usage: Usage::default(),
+            tool_calls: 0,
+            summary: None,
+            last_activity: now(),
         };
         state.insert(task.clone());
         task
     };
     d.save();
     d.emit(Event::TaskUpdated { task: task.clone() });
+    match copied {
+        Ok(files) if !files.is_empty() => {
+            let more = if files.len() > 5 { format!(" and {} more", files.len() - 5) } else { String::new() };
+            let names = files.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+            record(d, task.id, None, ActivityKind::Lifecycle, format!("Copied into the worktree: {names}{more}"));
+        }
+        Ok(_) => {}
+        Err(e) => record(d, task.id, None, ActivityKind::Lifecycle, format!("Couldn't copy local files: {e:#}")),
+    }
 
-    // Attached context moves to the task and is listed in the first prompt.
-    for id in &context {
-        let _ = context_store::move_to(d, *id, Scope::Task { id: task.id });
+    // Files attached in the New task window move to the task; items picked from a
+    // collection stay there. All of them are listed in the first prompt.
+    for item in context_store::get(d, &context) {
+        if item.scope == Scope::Draft {
+            let _ = context_store::move_to(d, item.id, Scope::Task { id: task.id });
+        }
     }
     let items = context_store::get(d, &context);
     let start = Start::Fresh { prompt: first_prompt(&prompt, &items) };
@@ -280,37 +396,6 @@ fn title_from(prompt: &str) -> String {
     } else {
         line.to_string()
     }
-}
-
-/// Claude Code hooks report what the agent is doing.
-fn on_hook(d: &Shared, id: TaskId, event: HookEvent, message: &str, session_id: Option<String>) {
-    d.update_task(id, |t| {
-        // Remember the conversation, to resume exactly this one later. (It changes after
-        // `/clear`, so always take the latest.)
-        if let Some(s) = session_id.filter(|s| !s.is_empty()) {
-            t.session = Some(s);
-        }
-        if !t.status.is_live() {
-            return; // stopped/done tasks stay as they are
-        }
-        // Hooks only fire once Claude Code has taken the prompt, so from now on there's a
-        // conversation to `--continue`.
-        if matches!(event, HookEvent::Running | HookEvent::Stopped) {
-            t.started = true;
-        }
-        t.status = match event {
-            HookEvent::Running => TaskStatus::Running,
-            // Claude also sends "waiting for your input" after a minute of idling. If it
-            // finished its turn, keep "review" instead of flipping to "needs you".
-            HookEvent::NeedsInput
-                if t.status == TaskStatus::Review && message.contains("waiting for your input") =>
-            {
-                TaskStatus::Review
-            }
-            HookEvent::NeedsInput => TaskStatus::NeedsInput,
-            HookEvent::Stopped => TaskStatus::Review,
-        };
-    });
 }
 
 async fn ship(task: &Task, how: ShipMethod) -> Result<String> {
@@ -389,6 +474,8 @@ async fn import(d: &Shared, repo: &std::path::Path, ids: &[String]) -> Result<Ve
     // Tasks belong to the main checkout (merges go there), whichever folder was picked.
     let main = git::worktrees(repo).await?.into_iter().next().context("no main checkout")?;
     let base = git::default_branch(&main).await?;
+    // Like a new task there: it uses the collections linked to the repo.
+    let collections = context_store::linked_to(d, &main);
 
     let mut created = Vec::new();
     for id in ids {
@@ -414,6 +501,14 @@ async fn import(d: &Shared, repo: &std::path::Path, ids: &[String]) -> Result<Ve
                 started: true,
                 session: Some(f.id.clone()),
                 adopted: true,
+                collections: collections.clone(),
+                doing: None,
+                plan: Vec::new(),
+                subagents: Vec::new(),
+                usage: Usage::default(),
+                tool_calls: 0,
+                summary: None,
+                last_activity: f.updated_at,
             };
             state.insert(task.clone());
             task
