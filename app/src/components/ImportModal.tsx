@@ -1,6 +1,9 @@
 import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { ago, api, repoName, type FoundSession } from "../api";
+import { ago, api, repoName, type FoundSession, type TaskStatus } from "../api";
+
+/** Statuses where an agent may be writing files. */
+const ACTIVE: TaskStatus[] = ["queued", "running", "needs_input"];
 import { recentRepos, rememberRepo, useStore } from "../store";
 import { Icon } from "./ui";
 
@@ -17,6 +20,8 @@ export function ImportModal({ initialRepo }: { initialRepo?: string }) {
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
   const [prompt, setPrompt] = useState("");
+  // Work in a separate copy (git worktree + branch) instead of the folder itself.
+  const [ownCopy, setOwnCopy] = useState<boolean | null>(null);
   const close = () => s.setImportOpen(false);
 
   useEffect(() => {
@@ -72,9 +77,31 @@ export function ImportModal({ initialRepo }: { initialRepo?: string }) {
     }
   }
 
+  // Agents already writing in this folder: here (not in a copy of their own) or in another terminal.
+  const inside = (dir: string) => dir === repo || dir.startsWith(repo + "/");
+  const busyHere = [
+    ...s.tasks.filter((t) => t.adopted && ACTIVE.includes(t.status) && inside(t.worktree)).map((t) => `#${t.id} ${t.title}`),
+    ...(found ?? []).filter((f) => f.open_elsewhere && f.task === null && inside(f.cwd)).map((f) => `${f.title} (another terminal)`),
+  ];
+  // Until you choose, a separate copy is suggested exactly when someone else is working here.
+  const separate = ownCopy ?? busyHere.length > 0;
+
   async function startHere() {
     setBusy(true);
-    const task = await s.run(() => api.openAgent(repo, prompt.trim()));
+    const task = await s.run(() =>
+      separate
+        ? api.newTask({
+            prompt: prompt.trim(),
+            repo,
+            base: "", // the branch work usually merges into
+            branch: null,
+            agent: { kind: "claude" },
+            model: null,
+            auto_approve: false,
+            context: [],
+          })
+        : api.openAgent(repo, prompt.trim()),
+    );
     setBusy(false);
     if (task) {
       rememberRepo(task.repo);
@@ -135,9 +162,28 @@ export function ImportModal({ initialRepo }: { initialRepo?: string }) {
               }}
             />
             <button className="btn btn-primary" onClick={startHere} disabled={busy}>
-              <Icon name="plus" /> Start an agent here
+              <Icon name="plus" /> {separate ? "Start in its own copy" : "Start an agent here"}
             </button>
           </div>
+        )}
+        {repo && busyHere.length > 0 && (
+          <div className="notice small">
+            <strong>
+              {busyHere.length === 1 ? "Another agent is" : `${busyHere.length} agents are`} working in this folder
+            </strong>{" "}
+            ({busyHere.slice(0, 2).join(", ")}
+            {busyHere.length > 2 ? "…" : ""}). Two agents in one folder can overwrite each other's files, and their changes get
+            mixed up. A separate copy keeps them apart.
+          </div>
+        )}
+        {repo && (
+          <label className="check small">
+            <input type="checkbox" checked={separate} onChange={(e) => setOwnCopy(e.target.checked)} />
+            <span>
+              Separate copy (git worktree on its own branch): agents can't step on each other, and you review and merge its
+              work when it's done. {busyHere.length === 0 && "Not needed for a single agent."}
+            </span>
+          </label>
         )}
 
         {repo && <h2 className="small muted thread-head">Threads already started here</h2>}

@@ -266,8 +266,10 @@ async fn new_task(
     context: Vec<ContextId>,
     collections: Option<Vec<philharmonic_core::CollectionId>>,
 ) -> Result<Task> {
-    if prompt.trim().is_empty() {
-        bail!("the prompt is empty");
+    // An empty prompt is fine: Claude Code opens at its prompt and waits for you.
+    let prompt = prompt.trim().to_string();
+    if prompt.is_empty() && !matches!(agent_kind, Agent::Claude) {
+        bail!("a custom command needs a prompt (it gets it in $PH_PROMPT)");
     }
     // One spelling per repo (`/tmp/x` and `/private/tmp/x` are the same repo), whichever
     // client sent it, so filters and project context line up.
@@ -282,6 +284,9 @@ async fn new_task(
         let names = git::branches(&repo).await?;
         if names.contains(&base) { base } else { git::current_branch(&repo).await? }
     };
+    // No base picked (quick start): the branch work usually merges into.
+    let base = if base.trim().is_empty() { git::default_branch(&repo).await? } else { base };
+    let folder_name = repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
 
     let repo_dir = paths::worktrees_dir()?.join(git::repo_name(&repo));
     let (branch, dest) = match branch.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
@@ -305,7 +310,10 @@ async fn new_task(
         }
         // Otherwise `ph/<from the prompt>`. If it's taken (same prompt twice), try `-2`, `-3`, …
         None => {
-            let base_slug = slugify(&prompt, 40);
+            let base_slug = match slugify(&prompt, 40) {
+                s if s.is_empty() => "agent".to_string(),
+                s => s,
+            };
             let mut n = 1;
             loop {
                 let slug = if n == 1 { base_slug.clone() } else { format!("{base_slug}-{n}") };
@@ -336,7 +344,7 @@ async fn new_task(
         let mut state = d.state.lock().unwrap();
         let task = Task {
             id: state.next_id(),
-            title: title_from(&prompt),
+            title: if prompt.is_empty() { format!("Agent in {folder_name} (own copy)") } else { title_from(&prompt) },
             prompt: prompt.clone(),
             repo,
             base,
@@ -383,8 +391,19 @@ async fn new_task(
     }
     let items = context_store::get(d, &context);
     let start = Start::Fresh { prompt: first_prompt(&prompt, &items) };
-    start_agent(d, &task, start, TaskStatus::Failed)
-        .map_err(|e| e.context("the worktree was created, but the agent couldn't start"))
+    let running = start_agent(d, &task, start, TaskStatus::Failed)
+        .map_err(|e| e.context("the worktree was created, but the agent couldn't start"))?;
+    if prompt.is_empty() && items.is_empty() {
+        // Nothing to work on yet: it waits for you.
+        return d
+            .update_task(task.id, |t| {
+                if t.status == TaskStatus::Running {
+                    t.status = TaskStatus::NeedsInput;
+                }
+            })
+            .context("no such task");
+    }
+    Ok(running)
 }
 
 /// Mark the task running, then start its agent. In that order: the agent may report

@@ -180,7 +180,8 @@ export const api = {
     model: string | null;
     auto_approve: boolean;
     context: number[];
-    collections: number[];
+    /** Missing: the collections linked to the repo. */
+    collections?: number[];
   }) => normalizeTask((await request<{ task: Task }>({ type: "new_task", ...args })).task),
   stop: (id: number) => request({ type: "stop", id }),
   resume: (id: number) => request({ type: "resume", id }),
