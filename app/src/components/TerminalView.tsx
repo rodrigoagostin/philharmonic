@@ -3,6 +3,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { api, b64ToBytes, onOutput, onResync } from "../api";
+import { routeComposition } from "../deadKeys";
 
 /** Lets the Focus view move around the terminal (jump to a prompt, previous/next prompt). */
 export interface TermControl {
@@ -66,10 +67,6 @@ export function TerminalView({
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(el);
-    // Dead keys (' ` ~ ^ " on Portuguese / US-International layouts): leave them to the
-    // OS, which composes them with the next key (' + a = á, ' + space = '). If xterm also
-    // handles the key press itself, WebKit gives you the character twice.
-    term.attachCustomKeyEventHandler((e) => !(e.key === "Dead" || (e.type === "keydown" && e.isComposing)));
     // Draw with the GPU: far less CPU and smooth scrolling. If WebGL isn't available or the
     // context is lost, xterm falls back to its (slower) DOM renderer.
     try {
@@ -145,6 +142,12 @@ export function TerminalView({
       queued += filtered;
       if (!flushTimer) flushTimer = setTimeout(flush, 10);
     });
+    // Accents / dead keys: the OS composes them, we send the result once (see deadKeys.ts).
+    const accents = routeComposition(term, el, (text) => {
+      queued += text;
+      if (!flushTimer) flushTimer = setTimeout(flush, 10);
+    });
+
     const d2 = term.onBinary((data) => {
       const bytes = new Uint8Array(data.length);
       for (let i = 0; i < data.length; i++) bytes[i] = data.charCodeAt(i) & 0xff;
@@ -186,8 +189,11 @@ export function TerminalView({
       };
     }
     const d3 = term.buffer.onBufferChange((b) => control?.current?.onFullScreenChange?.(b.type === "alternate"));
-    // ⌘↑ / ⌘↓ inside the terminal: previous / next prompt (instead of sending them to the agent).
+    // xterm takes ONE key handler (a second call replaces the first), so everything is here.
     term.attachCustomKeyEventHandler((e) => {
+      // Keys that are part of a dead-key composition: the OS handles them (see deadKeys.ts).
+      if (accents.blocks(e)) return false;
+      // ⌘↑ / ⌘↓ inside the terminal: previous / next prompt (instead of sending them to the agent).
       if (e.type === "keydown" && e.metaKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
         step(e.key === "ArrowUp" ? -1 : 1);
         return false;
@@ -222,6 +228,7 @@ export function TerminalView({
       off();
       offResync();
       ro.disconnect();
+      accents.dispose();
       d1.dispose();
       d2.dispose();
       d3.dispose();
