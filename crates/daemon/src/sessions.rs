@@ -165,6 +165,106 @@ fn shorten(text: &str, max: usize) -> String {
     }
 }
 
+/// Tools that write files, and the input field that holds the path.
+const EDIT_TOOLS: [(&str, &str); 4] =
+    [("Edit", "file_path"), ("MultiEdit", "file_path"), ("Write", "file_path"), ("NotebookEdit", "notebook_path")];
+
+/// Files a conversation edited (with its subagents), absolute. Files changed some other way
+/// (a shell command) aren't known. Cheap to call again: each transcript is read once, then
+/// only what was appended since.
+pub fn touched_files(cwd: &Path, session: &str) -> Vec<PathBuf> {
+    let Some(projects) = claude_dir().map(|d| d.join("projects")) else { return vec![] };
+    let file = format!("{session}.jsonl");
+    // Usually in the folder's directory; otherwise look in all of them.
+    let main = projects.join(encode(cwd)).join(&file);
+    let main = if main.exists() {
+        main
+    } else {
+        let found = std::fs::read_dir(&projects)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|d| d.path().join(&file))
+            .find(|p| p.exists());
+        match found {
+            Some(p) => p,
+            None => return vec![],
+        }
+    };
+    let mut transcripts = vec![main.clone()];
+    if let Ok(subs) = std::fs::read_dir(main.with_extension("").join("subagents")) {
+        transcripts.extend(subs.flatten().map(|f| f.path()).filter(|p| p.extension().is_some_and(|e| e == "jsonl")));
+    }
+    let mut all = std::collections::BTreeSet::new();
+    for t in transcripts {
+        all.extend(edits_in(&t, cwd));
+    }
+    all.into_iter().collect()
+}
+
+/// Per transcript: how far it was read, and the files found so far.
+type EditCache = std::collections::HashMap<PathBuf, (u64, HashSet<PathBuf>)>;
+static EDITS: std::sync::Mutex<Option<EditCache>> = std::sync::Mutex::new(None);
+
+fn edits_in(path: &Path, cwd: &Path) -> HashSet<PathBuf> {
+    use std::io::{Seek, SeekFrom};
+    let mut cache = EDITS.lock().unwrap();
+    let cache = cache.get_or_insert_with(Default::default);
+    let (mut offset, mut files) = cache.remove(path).unwrap_or_default();
+    let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if len < offset {
+        (offset, files) = (0, HashSet::new()); // rewritten: start over
+    }
+    if let Ok(mut f) = File::open(path)
+        && f.seek(SeekFrom::Start(offset)).is_ok()
+    {
+        let mut reader = BufReader::new(f);
+        let mut line = Vec::new();
+        // Only whole lines: one still being written is read next time.
+        while let Ok(n) = reader.read_until(b'\n', &mut line) {
+            if n == 0 || line.last() != Some(&b'\n') {
+                break;
+            }
+            offset += n as u64;
+            if let Ok(text) = std::str::from_utf8(&line)
+                && text.contains("\"tool_use\"")
+                && (text.contains("\"file_path\"") || text.contains("\"notebook_path\""))
+            {
+                add_edits(text, cwd, &mut files);
+            }
+            line.clear();
+        }
+    }
+    cache.insert(path.to_path_buf(), (offset, files.clone()));
+    files
+}
+
+fn add_edits(line: &str, cwd: &Path, files: &mut HashSet<PathBuf>) {
+    let Ok(v) = serde_json::from_str::<Value>(line) else { return };
+    let Some(parts) = v["message"]["content"].as_array() else { return };
+    for p in parts.iter().filter(|p| p["type"] == "tool_use") {
+        let name = p["name"].as_str().unwrap_or_default();
+        if let Some((_, field)) = EDIT_TOOLS.iter().find(|(tool, _)| *tool == name)
+            && let Some(file) = p["input"][field].as_str()
+        {
+            let file = cwd.join(file); // absolute paths stay as they are
+            files.insert(canonical(&file));
+        }
+    }
+}
+
+/// Like `canonicalize`, also for a file that no longer exists (deleted since): its folder is
+/// resolved instead, so paths compare equal to the repo's (`/tmp` vs `/private/tmp`).
+fn canonical(file: &Path) -> PathBuf {
+    if let Ok(p) = file.canonicalize() {
+        return p;
+    }
+    match (file.parent().and_then(|d| d.canonicalize().ok()), file.file_name()) {
+        (Some(dir), Some(name)) => dir.join(name),
+        _ => file.to_path_buf(),
+    }
+}
+
 /// Ids of the conversations open right now in some Claude Code process.
 pub fn open_now() -> HashSet<String> {
     let Some(dir) = claude_dir().map(|d| d.join("sessions")) else { return HashSet::new() };
@@ -195,6 +295,7 @@ fn is_alive(pid: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn encodes_like_claude_code() {
@@ -273,6 +374,31 @@ mod tests {
             ],
         );
         assert_eq!(find_in(&projects, &root)[0].title, "My name");
+    }
+
+    #[test]
+    fn finds_edited_files_and_reads_only_what_was_appended() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().canonicalize().unwrap();
+        let t = cwd.join("s.jsonl");
+        let edit = |name: &str, field: &str, file: &str| {
+            serde_json::json!({ "type": "assistant", "message": { "content": [
+                { "type": "text", "text": "file_path" },
+                { "type": "tool_use", "name": name, "input": { field: file, "content": "x" } },
+            ] } })
+            .to_string()
+        };
+        let read = edit("Read", "file_path", "/elsewhere/not-an-edit.rs");
+        std::fs::write(&t, format!("{}\n{}\n", edit("Write", "file_path", "src/a.rs"), read)).unwrap();
+        let mut got: Vec<_> = edits_in(&t, &cwd).into_iter().collect();
+        assert_eq!(got, [cwd.join("src/a.rs")]);
+
+        // Appended later, plus a half-written line (not read until it's complete).
+        let more = format!("{}\n{}", edit("NotebookEdit", "notebook_path", &cwd.join("n.ipynb").display().to_string()), &edit("Edit", "file_path", "b.rs")[..20]);
+        std::fs::OpenOptions::new().append(true).open(&t).unwrap().write_all(more.as_bytes()).unwrap();
+        got = edits_in(&t, &cwd).into_iter().collect();
+        got.sort();
+        assert_eq!(got, [cwd.join("n.ipynb"), cwd.join("src/a.rs")]);
     }
 
     #[test]

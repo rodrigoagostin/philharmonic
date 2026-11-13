@@ -174,7 +174,18 @@ async fn dispatch(request: Request, d: &Shared) -> Result<Response> {
             if task.base.is_empty() {
                 Response::Diff { files: Vec::new(), patch: String::new() }
             } else {
-                let (files, patch) = git::diff(&task.worktree, &task.base, patch).await?;
+                // A thread working in your own folder shares it with you and other threads:
+                // show only the files this conversation edited.
+                let only = if task.adopted {
+                    let (cwd, session) = (task.worktree.clone(), task.session.clone());
+                    Some(match session {
+                        Some(s) => tokio::task::spawn_blocking(move || sessions::touched_files(&cwd, &s)).await?,
+                        None => Vec::new(), // hasn't started a conversation yet
+                    })
+                } else {
+                    None
+                };
+                let (files, patch) = git::diff(&task.worktree, &task.base, patch, only.as_deref()).await?;
                 Response::Diff { files, patch }
             }
         }

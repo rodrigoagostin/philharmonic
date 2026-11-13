@@ -217,9 +217,34 @@ pub async fn branches(repo: &Path) -> Result<Vec<String>> {
 /// This runs often while an agent works, so it never touches the worktree's real index
 /// (that would take `index.lock` and make the agent's own `git add`/`commit` fail). It
 /// works on a throwaway copy instead.
-pub async fn diff(worktree: &Path, base: &str, with_patch: bool) -> Result<(Vec<FileChange>, String)> {
+///
+/// `only`: limit it to these files (absolute paths), e.g. the ones one conversation edited
+/// in a folder others work in too.
+pub async fn diff(
+    worktree: &Path,
+    base: &str,
+    with_patch: bool,
+    only: Option<&[PathBuf]>,
+) -> Result<(Vec<FileChange>, String)> {
     let merge_base = git(worktree, &["merge-base", base, "HEAD"]).await?;
     let merge_base = merge_base.trim();
+    // Pathspecs: git takes absolute paths as long as they're inside the repo.
+    let mut paths: Vec<String> = Vec::new();
+    if let Some(only) = only {
+        let top = toplevel(worktree).await?;
+        paths = only.iter().filter(|p| p.starts_with(&top)).map(|p| p.display().to_string()).collect();
+        if paths.is_empty() {
+            return Ok((Vec::new(), String::new()));
+        }
+    }
+    let with_paths = |args: &[&str]| -> Vec<String> {
+        let mut v: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        if !paths.is_empty() {
+            v.push("--".into());
+            v.extend(paths.iter().cloned());
+        }
+        v
+    };
 
     let index = TempIndex::copy_of(worktree).await?;
     let ix = Some(index.path());
@@ -228,11 +253,13 @@ pub async fn diff(worktree: &Path, base: &str, with_patch: bool) -> Result<(Vec<
     // `--no-renames`: otherwise numstat says `old => new` while the patch says `new`,
     // and the two lists don't match up in the app.
     let patch = if with_patch {
-        git_with_index(worktree, &["diff", "--no-renames", merge_base], ix).await?
+        let args = with_paths(&["diff", "--no-renames", merge_base]);
+        git_with_index(worktree, &args.iter().map(String::as_str).collect::<Vec<_>>(), ix).await?
     } else {
         String::new()
     };
-    let numstat = git_with_index(worktree, &["diff", "--no-renames", "--numstat", merge_base], ix).await?;
+    let args = with_paths(&["diff", "--no-renames", "--numstat", merge_base]);
+    let numstat = git_with_index(worktree, &args.iter().map(String::as_str).collect::<Vec<_>>(), ix).await?;
     let files = numstat
         .lines()
         .filter_map(|line| {
@@ -402,7 +429,7 @@ mod tests {
         std::fs::write(wt.join("new.txt"), "hi\n").unwrap();
         std::fs::write(wt.join("a.txt"), "two\n").unwrap();
 
-        let (files, patch) = diff(&wt, "main", true).await.unwrap();
+        let (files, patch) = diff(&wt, "main", true, None).await.unwrap();
 
         let mut paths: Vec<_> = files.iter().map(|f| f.path.as_str()).collect();
         paths.sort();

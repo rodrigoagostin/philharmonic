@@ -214,7 +214,15 @@ export function Review({ task }: { task: Task }) {
 
         <div className="diff-area">
           {loading && <p className="muted">Loading diff…</p>}
-          {!loading && diffs.length === 0 && <p className="muted empty">No changes on this branch yet.</p>}
+          {!loading && diffs.length === 0 && (
+            <p className="muted empty">
+              {!task.base
+                ? "This folder isn't a git repository, so there's nothing to compare."
+                : task.adopted
+                  ? "This thread hasn't edited any files yet (only its own edits are shown here)."
+                  : "No changes on this branch yet."}
+            </p>
+          )}
           {shown.map((d) => (
             <section key={d.path} className="diff-file">
               <h3 className="diff-file-head mono">{d.path}</h3>

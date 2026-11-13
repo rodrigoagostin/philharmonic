@@ -111,7 +111,12 @@ export function Focus({ task }: { task: Task }) {
             <h2>
               Changed files <span className="muted">{files.length}</span>
             </h2>
-            {files.length === 0 && <p className="muted small">No changes yet.</p>}
+            {task.adopted && task.base && (
+              <p className="muted small">Only the files this thread edited (others in the folder aren't shown).</p>
+            )}
+            {files.length === 0 && (
+              <p className="muted small">{task.adopted && !task.base ? "Not a git repository: nothing to compare." : "No changes yet."}</p>
+            )}
             {files.map((f) => (
               <div key={f.path} className="file-row">
                 <span className="ellipsis grow mono small">{f.path}</span>
