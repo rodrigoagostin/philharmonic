@@ -21,6 +21,10 @@ export function TerminalView({ id, live }: { id: number; live: boolean }) {
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(el);
+    // Dead keys (' ` ~ ^ " on Portuguese / US-International layouts): leave them to the
+    // OS, which composes them with the next key (' + a = á, ' + space = '). If xterm also
+    // handles the key press itself, WebKit gives you the character twice.
+    term.attachCustomKeyEventHandler((e) => !(e.key === "Dead" || (e.type === "keydown" && e.isComposing)));
 
     // Every output chunk carries its position in the task's output stream, and the history
     // says where it ends. `pos` is how far this terminal has written, so each byte is
